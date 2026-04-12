@@ -1,0 +1,56 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+
+@pytest.mark.asyncio
+async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str((Path(__file__).resolve().parents[1] / "src"))
+    env["GRAPH_MEMORY_DB_PATH"] = str(tmp_path / "integration-memory.db")
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "graph_memory.server"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=env,
+    )
+
+    async with stdio_client(server_params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            init_result = await session.initialize()
+            assert init_result.serverInfo.name == "graph-memory"
+
+            tools_result = await session.list_tools()
+            assert len(tools_result.tools) == 15
+            assert {tool.name for tool in tools_result.tools} >= {
+                "store_node",
+                "query_graph",
+                "observe_conversation",
+                "graph_diff",
+                "prime_context",
+                "get_topics",
+                "get_stats",
+                "export_graph_html",
+                "export_graph_backup",
+                "import_graph_backup",
+            }
+
+            resources_result = await session.list_resources()
+            assert len(resources_result.resources) == 2
+            assert {str(resource.uri) for resource in resources_result.resources} == {
+                "graph://stats",
+                "graph://recent",
+            }
+
+            stats_result = await session.call_tool("get_stats", {})
+            assert "Memory Graph Stats" in stats_result.content[0].text
+
+            resource_result = await session.read_resource("graph://stats")
+            assert "Memory Graph Stats" in resource_result.contents[0].text

@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+from graph_memory.errors import ValidationFailure
+
+
+@dataclass(slots=True)
+class AppConfig:
+    backend: str
+    transport: str
+    model_name: str
+    db_path: str
+    default_tenant_id: str
+    http_host: str
+    http_port: int
+    log_level: str
+    rate_limit_rpm: int
+    write_rate_limit_rpm: int
+    max_concurrent_requests: int
+    max_payload_bytes: int
+    request_timeout_seconds: int
+    export_dir: str | None
+    neo4j_uri: str
+    neo4j_username: str
+    neo4j_password: str
+    neo4j_database: str
+
+    @classmethod
+    def from_env(cls) -> "AppConfig":
+        config = cls(
+            backend=os.environ.get("GRAPH_MEMORY_BACKEND", "sqlite").strip().lower(),
+            transport=os.environ.get("GRAPH_MEMORY_TRANSPORT", "stdio").strip().lower(),
+            model_name=os.environ.get("GRAPH_MEMORY_MODEL", "all-MiniLM-L6-v2"),
+            db_path=os.environ.get("GRAPH_MEMORY_DB_PATH", "memory.db"),
+            default_tenant_id=os.environ.get("GRAPH_MEMORY_DEFAULT_TENANT_ID", "local-default").strip(),
+            http_host=os.environ.get("GRAPH_MEMORY_HTTP_HOST", "0.0.0.0"),
+            http_port=int(os.environ.get("GRAPH_MEMORY_HTTP_PORT", "8080")),
+            log_level=os.environ.get("GRAPH_MEMORY_LOG_LEVEL", "INFO"),
+            rate_limit_rpm=int(os.environ.get("GRAPH_MEMORY_RATE_LIMIT_RPM", "120")),
+            write_rate_limit_rpm=int(os.environ.get("GRAPH_MEMORY_WRITE_RATE_LIMIT_RPM", "60")),
+            max_concurrent_requests=int(os.environ.get("GRAPH_MEMORY_MAX_CONCURRENT_REQUESTS", "8")),
+            max_payload_bytes=int(os.environ.get("GRAPH_MEMORY_MAX_PAYLOAD_BYTES", str(1024 * 1024))),
+            request_timeout_seconds=int(os.environ.get("GRAPH_MEMORY_REQUEST_TIMEOUT_SECONDS", "30")),
+            export_dir=os.environ.get("GRAPH_MEMORY_EXPORT_DIR"),
+            neo4j_uri=os.environ.get("GRAPH_MEMORY_NEO4J_URI", "").strip(),
+            neo4j_username=os.environ.get("GRAPH_MEMORY_NEO4J_USERNAME", "").strip(),
+            neo4j_password=os.environ.get("GRAPH_MEMORY_NEO4J_PASSWORD", ""),
+            neo4j_database=os.environ.get("GRAPH_MEMORY_NEO4J_DATABASE", "").strip(),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if self.transport not in {"stdio", "http"}:
+            raise ValidationFailure(f"Unsupported GRAPH_MEMORY_TRANSPORT: {self.transport}")
+        if self.backend not in {"sqlite", "neo4j"}:
+            raise ValidationFailure(f"Unsupported GRAPH_MEMORY_BACKEND: {self.backend}")
+        if self.transport == "http" and self.backend != "neo4j":
+            raise ValidationFailure("HTTP transport requires GRAPH_MEMORY_BACKEND=neo4j.")
+        if not self.default_tenant_id:
+            raise ValidationFailure("GRAPH_MEMORY_DEFAULT_TENANT_ID cannot be empty.")
+        if self.backend == "neo4j" and (not self.neo4j_uri or not self.neo4j_username or not self.neo4j_password):
+            raise ValidationFailure(
+                "Neo4j backend requires GRAPH_MEMORY_NEO4J_URI, GRAPH_MEMORY_NEO4J_USERNAME, and GRAPH_MEMORY_NEO4J_PASSWORD."
+            )

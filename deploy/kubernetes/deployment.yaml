@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graph-memory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graph-memory
+  template:
+    metadata:
+      labels:
+        app: graph-memory
+    spec:
+      containers:
+        - name: graph-memory
+          image: graph-memory-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: graph-memory-config
+            - secretRef:
+                name: graph-memory-secret
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
