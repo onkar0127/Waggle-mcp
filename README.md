@@ -11,6 +11,7 @@
   <a href="https://pypi.org/project/graph-memory-mcp"><img src="https://img.shields.io/pypi/v/graph-memory-mcp?color=39d5cf&label=pypi" alt="PyPI"/></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"/>
   <img src="https://img.shields.io/badge/MCP-compatible-brightgreen" alt="MCP"/>
+  <img src="https://img.shields.io/badge/embeddings-local%2C%20no%20API%20key-orange" alt="Local embeddings"/>
   <img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="MIT"/>
 </p>
 
@@ -49,30 +50,113 @@ The `init` wizard detects your MCP client, writes its config file, and creates
 the database directory — no JSON editing required. Supports **Claude Desktop**,
 **Cursor**, **Codex**, and a generic JSON fallback.
 
-After init, restart your MCP client. Your AI will now have access to all 15
-memory tools automatically.
+After init, restart your MCP client and your AI has persistent memory.  
+No cloud service. No API key. Semantic search runs fully locally.
 
 ---
 
 ## How it works
 
+Memory doesn't just get stored — it flows through a lifecycle:
+
 ```
-Your AI agent
-     │  MCP (stdio or HTTP)
-     ▼
-graph-memory-mcp
-     │
-     ├─ store_node("Prefer TypeScript over Python", type=preference)
-     ├─ store_edge(preference → project, relates_to)
-     ├─ query_graph("what does the user prefer?")
-     └─ observe_conversation(user_msg, assistant_msg)  ← auto-extracts facts
-     │
-     ▼
-Knowledge graph (SQLite locally · Neo4j in production)
+You talk to your AI
+        │
+        ▼
+  observe_conversation()          ← AI drops the turn in; facts are auto-extracted
+        │
+        ▼
+  Graph nodes are created         ← "Chose PostgreSQL" becomes a decision node
+  Edges are inferred              ← linked to the "database" entity node
+        │
+        ▼
+  Future conversation starts
+        │
+        ▼
+  query_graph("DB schema")        ← semantic search finds the node from 3 sessions ago
+        │
+        ▼
+  AI answers with full context    ← "You decided on PostgreSQL on Apr 10, here's why…"
 ```
 
-Every piece of memory is a **typed node** with semantic embeddings.  
-Queries understand natural language including temporal phrases like *"recently"*, *"last week"*, *"originally"*.
+Every node carries semantic embeddings computed **locally** using
+[`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) —
+a fast, lightweight model that runs entirely on-device with no API key or network
+call required. This means semantic search works offline, costs nothing per query,
+and keeps your data private.
+
+---
+
+## See it in action
+
+Here's a concrete before/after for a developer using the AI daily:
+
+**Session 1** — April 10
+```
+User:  Let's use PostgreSQL. MySQL replication has been painful.
+Agent: [calls observe_conversation()]
+       → stores decision node: "Chose PostgreSQL over MySQL"
+       → stores reason node: "MySQL replication painful"
+       → links them with depends_on edge
+```
+
+**Session 2** — April 12 (fresh context window, no history)
+```
+User:  What did we decide about the database?
+Agent: [calls query_graph("database decision")]
+       → retrieves the decision node + linked reason from April 10
+
+       "You decided on PostgreSQL on April 10. The reason recorded was
+        that MySQL replication had been painful."
+```
+
+**Session 3** — April 14
+```
+User:  Actually, let's reconsider — the team is more familiar with MySQL.
+Agent: [calls store_node() + store_edge(new_node → old_node, "contradicts")]
+       → conflict is flagged automatically; both positions are preserved in the graph
+```
+
+> The agent never needed explicit instructions to remember or retrieve — it called
+> the right tools based on the conversation, and the graph gave it the right context.
+
+---
+
+## The magic tool: `observe_conversation`
+
+> **This is the tool you'll use most.** You don't have to manually store facts — just
+> tell the agent to observe each conversation turn and it handles the rest.
+
+```
+observe_conversation(user_message, assistant_response)
+```
+
+Under the hood, it:
+1. Extracts atomic facts from both sides of the conversation
+2. Deduplicates against existing nodes using semantic similarity
+3. Creates typed edges between related concepts
+4. Flags contradictions with existing stored beliefs
+
+No instructions needed. No schema to define. Just observe.
+
+---
+
+## Temporal queries — a solved problem most memory systems skip
+
+Most memory systems answer "what do you know about X?" — but can't answer
+*when* you learned it or how knowledge changed over time.
+
+`graph-memory-mcp` understands temporal natural language natively:
+
+| Query | What happens |
+|-------|-------------|
+| `query_graph("what did we decide recently")` | Filters nodes updated in the last 24–48h |
+| `query_graph("what was the original plan")` | Retrieves the earliest version of relevant nodes |
+| `query_graph("what changed last week")` | Returns a diff of nodes created/updated in that window |
+| `graph_diff(since="48h")` | Explicit changelog: added nodes, updated nodes, new conflicts |
+
+This is built on timestamped nodes + temporal phrase parsing — no vector-clock
+complexity, but enough to reconstruct a meaningful timeline of decisions.
 
 ---
 
@@ -102,14 +186,14 @@ Queries understand natural language including temporal phrases like *"recently"*
 
 | Tool | What it does |
 |------|-------------|
-| `store_node` | Save a fact, preference, decision, or note |
-| `store_edge` | Link two nodes with a typed relationship |
+| `observe_conversation` | **Drop a conversation turn in — facts auto-extracted, stored, and linked** |
 | `query_graph` | Semantic + temporal search across the graph |
+| `store_node` | Manually save a fact, preference, decision, or note |
+| `store_edge` | Link two nodes with a typed relationship |
 | `get_related` | Traverse edges from a specific node |
 | `update_node` | Update content or tags on an existing node |
 | `delete_node` | Remove a node and all its edges |
 | `decompose_and_store` | Break long content into atomic nodes automatically |
-| `observe_conversation` | Auto-extract and store facts from a conversation turn |
 | `graph_diff` | See what changed in the last N hours |
 | `prime_context` | Generate a compact brief for a new conversation |
 | `get_topics` | Detect topic clusters via community detection |
@@ -129,6 +213,14 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 graph-memory-mcp init        # ← writes your client config automatically
 ```
+
+Three key variables for local mode:
+
+| Variable | What it does |
+|----------|-------------|
+| `GRAPH_MEMORY_BACKEND=sqlite` | Local file DB, zero setup |
+| `GRAPH_MEMORY_TRANSPORT=stdio` | Connects to desktop MCP clients |
+| `GRAPH_MEMORY_DB_PATH` | Where the graph is stored (default: `memory.db`) |
 
 ### Production (Neo4j backend)
 
@@ -167,8 +259,7 @@ docker run --rm -p 8080:8080 \
 
 ## Manual client configuration
 
-If you prefer to edit config files directly, or the `init` wizard doesn't cover
-your client, here are the snippets.
+If you prefer to edit config files directly, or `init` doesn't cover your client:
 
 ### Claude Desktop — `claude_desktop_config.json`
 
@@ -199,12 +290,12 @@ command = "/path/to/.venv/bin/python"
 args    = ["-m", "graph_memory.server"]
 cwd     = "/path/to/graph-memory-mcp"
 env     = {
-  PYTHONPATH                    = "/path/to/graph-memory-mcp/src",
-  GRAPH_MEMORY_TRANSPORT        = "stdio",
-  GRAPH_MEMORY_BACKEND          = "sqlite",
-  GRAPH_MEMORY_DB_PATH          = "~/.graph-memory/memory.db",
+  PYTHONPATH                     = "/path/to/graph-memory-mcp/src",
+  GRAPH_MEMORY_TRANSPORT         = "stdio",
+  GRAPH_MEMORY_BACKEND           = "sqlite",
+  GRAPH_MEMORY_DB_PATH           = "~/.graph-memory/memory.db",
   GRAPH_MEMORY_DEFAULT_TENANT_ID = "local-default",
-  GRAPH_MEMORY_MODEL            = "all-MiniLM-L6-v2"
+  GRAPH_MEMORY_MODEL             = "all-MiniLM-L6-v2"
 }
 ```
 
@@ -215,7 +306,7 @@ A pre-filled example is in [`codex_config.example.toml`](./codex_config.example.
 ## Environment variables
 
 <details>
-<summary>Click to expand all environment variables</summary>
+<summary>Click to expand full reference</summary>
 
 ### Core
 
@@ -223,7 +314,7 @@ A pre-filled example is in [`codex_config.example.toml`](./codex_config.example.
 |----------|---------|-------------|
 | `GRAPH_MEMORY_BACKEND` | `sqlite` | `sqlite` or `neo4j` |
 | `GRAPH_MEMORY_TRANSPORT` | `stdio` | `stdio` or `http` |
-| `GRAPH_MEMORY_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model |
+| `GRAPH_MEMORY_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model (local inference) |
 | `GRAPH_MEMORY_DEFAULT_TENANT_ID` | `local-default` | default tenant |
 | `GRAPH_MEMORY_EXPORT_DIR` | — | optional export directory |
 
@@ -329,7 +420,7 @@ GRAPH_MEMORY_API_KEY=<key> ./scripts/load_test.sh --medium
 
 ```
 graph-memory-mcp
-├── Core domain    graph CRUD · dedup · embeddings · conflict detection · export/import
+├── Core domain    graph CRUD · dedup · local embeddings · conflict detection · export/import
 ├── Transport      stdio MCP (Codex/Desktop) · streamable HTTP MCP (Kubernetes)
 └── Platform       config · auth · tenant isolation · rate limiting · logging · metrics
 ```
