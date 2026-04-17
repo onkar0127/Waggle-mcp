@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from waggle.graph import MemoryGraph
-from waggle.models import NodeType
+from waggle.models import NodeType, RelationType
 from waggle.config import AppConfig
-from waggle.server import WaggleServer, _default_graph
+from waggle.server import (
+    WaggleServer,
+    _assert_runtime_feature_parity,
+    _build_parser,
+    _default_graph,
+    _run_admin_command,
+    _write_codex,
+    _write_other,
+)
 
 
 class FakeEmbeddingModel:
@@ -150,6 +160,192 @@ def test_export_and_import_backup_tools(tmp_path: Path) -> None:
     assert target.graph.get_stats().total_nodes == 1
 
 
+def test_export_context_bundle_tool(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    decision = app.graph.add_node(
+        label="Ship portable export",
+        content="We decided to ship portable context export first.",
+        node_type=NodeType.DECISION,
+    ).node
+    reason = app.graph.add_node(
+        label="Rate limits block handoff",
+        content="Rate limits force users to move context across AIs.",
+        node_type=NodeType.FACT,
+    ).node
+    app.graph.add_edge(
+        source_id=decision.id,
+        target_id=reason.id,
+        relationship=RelationType.DEPENDS_ON,
+    )
+
+    result = app.handle_tool_call(
+        "export_context_bundle",
+        {
+            "mode": "query",
+            "query": "why did we ship portable export",
+            "format": "both",
+            "output_path": str(tmp_path / "handoff"),
+        },
+    )
+
+    assert result.isError is False
+    assert result.structuredContent["mode"] == "query"
+    assert result.structuredContent["node_count"] >= 1
+    assert Path(result.structuredContent["markdown_path"]).exists()
+    assert Path(result.structuredContent["json_path"]).exists()
+    assert result.structuredContent["render_hints"]["token_estimate"] > 0
+    assert "Context Bundle Export" in result.content[0].text
+
+
+def test_get_node_history_tool(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    observed = app.handle_tool_call(
+        "observe_conversation",
+        {
+            "user_message": "We chose PostgreSQL over MySQL because ACID matters.",
+            "assistant_response": "I'll remember that decision.",
+        },
+    )
+    decision = next(
+        node for node in observed.structuredContent["stored_nodes"]
+        if node["label"] == "Database decision"
+    )
+
+    result = app.handle_tool_call("get_node_history", {"node_id": decision["id"], "max_depth": 1})
+
+    assert result.isError is False
+    assert result.structuredContent["node"]["evidence_records"]
+    assert "Node History" in result.content[0].text
+
+
+def test_timeline_tool(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    decision = app.graph.add_node(
+        label="Use PostgreSQL",
+        content="We chose PostgreSQL.",
+        node_type=NodeType.DECISION,
+    ).node
+    app.graph.observe_conversation(
+        user_message="We chose PostgreSQL.",
+        assistant_response="I'll remember that decision.",
+    )
+
+    result = app.handle_tool_call(
+        "timeline",
+        {"node_id": decision.id, "limit": 10, "include_evidence": True},
+    )
+
+    assert result.isError is False
+    assert result.structuredContent["scope"] == f"node:{decision.id}"
+    assert any(item["kind"] == "evidence" for item in result.structuredContent["items"])
+    assert "Timeline" in result.content[0].text
+
+
+def test_list_conflicts_and_resolve_conflict_tools(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.handle_tool_call(
+        "store_node",
+        {
+            "label": "REST Preference",
+            "content": "User prefers REST APIs for backend services",
+            "node_type": NodeType.PREFERENCE.value,
+        },
+    )
+    app.handle_tool_call(
+        "store_node",
+        {
+            "label": "GraphQL Preference",
+            "content": "User prefers GraphQL APIs for backend services",
+            "node_type": NodeType.PREFERENCE.value,
+        },
+    )
+
+    listed = app.handle_tool_call("list_conflicts", {})
+    edge_id = listed.structuredContent["conflicts"][0]["edge"]["id"]
+    resolved = app.handle_tool_call(
+        "resolve_conflict",
+        {"edge_id": edge_id, "resolution_note": "Superseded by the newer API decision."},
+    )
+    unresolved_after = app.handle_tool_call("list_conflicts", {})
+    resolved_after = app.handle_tool_call("list_conflicts", {"include_resolved": True})
+
+    assert listed.isError is False
+    assert len(listed.structuredContent["conflicts"]) == 1
+    assert resolved.isError is False
+    assert resolved.structuredContent["resolved"] is True
+    assert unresolved_after.structuredContent["conflicts"] == []
+    assert resolved_after.structuredContent["conflicts"][0]["resolved"] is True
+
+
+def test_list_context_scopes_tool(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.handle_tool_call(
+        "store_node",
+        {
+            "label": "Scoped node",
+            "content": "This belongs to the alpha workspace.",
+            "node_type": NodeType.NOTE.value,
+            "agent_id": "codex",
+            "project": "alpha",
+            "session_id": "sess-1",
+        },
+    )
+
+    result = app.handle_tool_call("list_context_scopes", {})
+
+    assert result.isError is False
+    assert result.structuredContent["agent_ids"] == ["codex"]
+    assert result.structuredContent["projects"] == ["alpha"]
+    assert result.structuredContent["session_ids"] == ["sess-1"]
+
+
+def test_export_context_bundle_cli_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    app = make_app(tmp_path)
+    app.graph.add_node(
+        label="CLI Export Decision",
+        content="Use the CLI export command for handoff workflows.",
+        node_type=NodeType.DECISION,
+    )
+
+    args = SimpleNamespace(
+        command="export-context-bundle",
+        mode="graph",
+        query="",
+        project="",
+        max_nodes=25,
+        max_depth=2,
+        format="both",
+        output_path=str(tmp_path / "cli-handoff"),
+        include_edges=True,
+        include_timestamps=True,
+        include_source_prompt=False,
+        audience="llm",
+    )
+    exit_code = _run_admin_command(app.config, args)
+    captured = capsys.readouterr().out
+    payload = json.loads(captured)
+
+    assert exit_code == 0
+    assert payload["mode"] == "graph"
+    assert Path(payload["markdown_path"]).exists()
+    assert Path(payload["json_path"]).exists()
+
+
+def test_runtime_feature_parity_check_passes_for_current_memory_graph() -> None:
+    _assert_runtime_feature_parity()
+
+
+def test_cli_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = _build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--version"])
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 0
+    assert "waggle-mcp 0.1.3" in captured.out
+
+
 def test_store_node_reports_deduplication(tmp_path: Path) -> None:
     app = make_app(tmp_path)
 
@@ -214,6 +410,7 @@ def test_observe_conversation_tool(tmp_path: Path) -> None:
 
     assert result.isError is False
     assert result.structuredContent["created_count"] >= 2
+    assert any(node["evidence_records"] for node in result.structuredContent["stored_nodes"])
     assert "Conversation Observation" in result.content[0].text
 
 
@@ -364,3 +561,24 @@ def test_default_graph_requires_neo4j_connection_settings(monkeypatch: pytest.Mo
 
     with pytest.raises(RuntimeError, match="Neo4j backend requires"):
         _default_graph()
+
+
+def test_write_other_config_no_longer_uses_pythonpath(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config_path = _write_other(str(tmp_path / "memory.db"), "/tmp/fake-python")
+    contents = config_path.read_text()
+    payload = json.loads(contents)
+
+    assert "PYTHONPATH" not in contents
+    assert payload["args"] == ["-m", "waggle.server"]
+
+
+def test_write_codex_config_no_longer_uses_pythonpath(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config_path = _write_codex(str(tmp_path / "memory.db"), "/tmp/fake-python")
+    contents = config_path.read_text()
+
+    assert "PYTHONPATH" not in contents
+    assert 'args = ["-m", "waggle.server"]' in contents

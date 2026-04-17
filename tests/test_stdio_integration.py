@@ -28,10 +28,15 @@ async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
             assert init_result.serverInfo.name == "waggle"
 
             tools_result = await session.list_tools()
-            assert len(tools_result.tools) == 15
+            assert len(tools_result.tools) == 21
             assert {tool.name for tool in tools_result.tools} >= {
                 "store_node",
                 "query_graph",
+                "list_context_scopes",
+                "get_node_history",
+                "timeline",
+                "list_conflicts",
+                "resolve_conflict",
                 "observe_conversation",
                 "graph_diff",
                 "prime_context",
@@ -39,6 +44,7 @@ async def test_server_stdio_initialize_and_basic_calls(tmp_path: Path) -> None:
                 "get_stats",
                 "export_graph_html",
                 "export_graph_backup",
+                "export_context_bundle",
                 "import_graph_backup",
             }
 

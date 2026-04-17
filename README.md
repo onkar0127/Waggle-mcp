@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <strong>Persistent, structured memory for AI agents — backed by a real knowledge graph.</strong><br/>
-  Your LLM remembers facts, decisions, and context <em>across every conversation</em>.
+  <strong>Persistent, structured memory for AI agents — 4× fewer tokens than chunk-based retrieval.</strong><br/>
+  Your LLM remembers facts, decisions, and context <em>across every conversation</em>, backed by a real knowledge graph.
 </p>
 
 <p align="center">
@@ -31,40 +31,13 @@ Waggle's key advantage is **token efficiency with structured context**:
 | Flat bullet-list memory | Typed edges: `relates_to`, `contradicts`, `depends_on`, `updates`… |
 | One session, one agent | Multi-tenant, multi-session, multi-agent |
 
-> **Note on retrieval:** Waggle trades some raw recall coverage for dramatically lower token cost and richer relational context. See the [benchmark section](#performance--benchmarking) for honest numbers.
+### How Waggle compares to chunk-replay memory systems
 
----
+Most AI memory tools store raw conversation chunks and replay them into context. Waggle takes a different approach: it stores structured knowledge as a typed graph — decisions, reasons, contradictions, dependencies — and assembles compact context at query time.
 
-## Context Assembly: Before & After
+The tradeoff is deliberate: Waggle uses ~4× fewer tokens per retrieval and surfaces full reasoning chains (decision + why + what changed), at some cost to raw verbatim recall on retrieval benchmarks. If your use case values structured reasoning and token efficiency over exhaustive session replay, Waggle is built for that.
 
-The query system now uses **graph-native context assembly** (not chunk retrieval) to avoid the "decision without reasoning" problem.
-
-### Before (FIFO traversal, no support coverage)
-```
-Query: "What database did we decide on?"
-
-Result: 1 node
-├─ ✓ "Use PostgreSQL" (decision)
-└─ ✗ NO REASON why PostgreSQL was chosen
-   (Agent has to guess or ask follow-up)
-```
-
-### After (weighted traversal + support bundling)
-```
-Query: "What database did we decide on?"
-
-Result: 2+ nodes
-├─ ✓ "Use PostgreSQL" (decision)
-├─ ✓ "ACID compliance required" (reason, via depends_on edge)
-└─ ✓ "SQLite can't handle concurrent writes" (underlying fact)
-   (Agent has full context and can explain the choice)
-```
-
-**What changed:**
-- **Relation weights**: `contradicts=1.0` → `depends_on=0.95` → `similar_to=0.30` (prioritize strong reasoning)
-- **Support bundling**: auto-includes contradictions, updates, dependencies
-- **Priority heap traversal**: relation priority × edge weight × depth decay (weak paths prune)
-- **Expansion metadata**: tracks *how* each node was reached
+> **Note on retrieval:** Waggle prioritizes compact, structured context over raw recall volume — delivering ~4× fewer tokens per retrieval with full reasoning chains. See the [benchmark section](#performance--benchmarking) for honest numbers.
 
 ---
 
@@ -141,6 +114,85 @@ Agent: [calls store_node() + store_edge(new_node → old_node, "contradicts")]
 
 ---
 
+## Portable context handoff
+
+Hit a rate limit? Switching models mid-project? Handing context to a colleague's AI?
+
+`export_context_bundle` generates a Markdown or JSON context pack that any AI can consume directly — no Waggle installation required on the receiving end.
+
+```python
+export_context_bundle({
+  "mode": "query",
+  "query": "database architecture decisions",
+  "format": "both"
+})
+```
+
+The Markdown bundle is structured for LLM ingestion:
+
+```markdown
+# Waggle Context Bundle
+> Exported 2025-06-20T14:32:00Z · query mode · 8 nodes
+
+## Summary
+This context covers database architecture decisions across 3 sessions.
+
+## Key Decisions
+- **Use PostgreSQL over MySQL** (April 10)
+  Reason: MySQL replication was painful
+  Status: Under reconsideration — team familiarity with MySQL raised April 14
+
+## Active Contradictions
+- PostgreSQL vs MySQL: original decision (April 10) contradicted April 14
+
+## Timeline
+- April 10: Decided PostgreSQL, stored reason
+- April 12: Retrieved decision + reason successfully
+- April 14: New position recorded, contradiction flagged
+```
+
+The JSON bundle carries the same information in a structured schema with token estimates, node IDs, edge types, and render hints for programmatic consumption.
+
+Three modes:
+- `prime` — curated brief from the existing `prime_context` pipeline
+- `query` — retrieval results plus supporting edges for a specific question
+- `graph` — full tenant graph, chunked and summarized for large exports
+
+---
+
+## Context Assembly: Before & After
+
+The query system now uses **graph-native context assembly** (not chunk retrieval) to avoid the "decision without reasoning" problem.
+
+### Before (FIFO traversal, no support coverage)
+```
+Query: "What database did we decide on?"
+
+Result: 1 node
+├─ ✓ "Use PostgreSQL" (decision)
+└─ ✗ NO REASON why PostgreSQL was chosen
+   (Agent has to guess or ask follow-up)
+```
+
+### After (weighted traversal + support bundling)
+```
+Query: "What database did we decide on?"
+
+Result: 2+ nodes
+├─ ✓ "Use PostgreSQL" (decision)
+├─ ✓ "ACID compliance required" (reason, via depends_on edge)
+└─ ✓ "SQLite can't handle concurrent writes" (underlying fact)
+   (Agent has full context and can explain the choice)
+```
+
+**What changed:**
+- **Relation weights**: `contradicts=1.0` → `depends_on=0.95` → `similar_to=0.30` (prioritize strong reasoning)
+- **Support bundling**: auto-includes contradictions, updates, dependencies
+- **Priority heap traversal**: relation priority × edge weight × depth decay (weak paths prune)
+- **Expansion metadata**: tracks *how* each node was reached
+
+---
+
 ## How it works
 
 Memory doesn't just get stored — it flows through a lifecycle:
@@ -149,7 +201,7 @@ Memory doesn't just get stored — it flows through a lifecycle:
 You talk to your AI
         │
         ▼
-  observe_conversation()          ← AI drops the turn in; facts extracted via structured LLM (regex fallback)
+  observe_conversation()          ← AI drops the turn in; facts extracted via deterministic conversation parsing
         │
         ▼
   Graph nodes are created         ← "Chose PostgreSQL" becomes a decision node
@@ -190,7 +242,7 @@ Under the hood, it:
 
 No instructions needed. No schema to define. Just observe.
 
-Under the hood, every call runs a **Pydantic-validated LLM extraction pass** (with a regex fallback) to pull structured facts out of messy dialogue.
+Under the hood, every call runs a deterministic extraction pass that turns messy dialogue into typed graph nodes without requiring a second local model runtime.
 
 **Example:** `"Let's use PostgreSQL because MySQL replication is too painful."`
 
@@ -201,14 +253,11 @@ Under the hood, every call runs a **Pydantic-validated LLM extraction pass** (wi
       "label": "PostgreSQL for generic events",
       "content": "Chose PostgreSQL over MySQL because MySQL replication is too painful.",
       "node_type": "decision",
-      "confidence": 0.95,
-      "tags": ["llm-extracted", "confidence:0.95"]
+      "tags": ["observed", "speaker:user"]
     }
   ]
 }
 ```
-
-*Any extraction with `confidence < 0.5` or an invalid schema is silently dropped to prevent hallucination noise.*
 
 ---
 
@@ -243,6 +292,11 @@ Under the hood, every call runs a **Pydantic-validated LLM extraction pass** (wi
 | `store_node` | Manually save a fact, preference, decision, or note |
 | `store_edge` | Link two nodes with a typed relationship |
 | `get_related` | Traverse edges from a specific node |
+| `get_node_history` | Inspect one node's evidence, validity window, and related context |
+| `list_context_scopes` | Enumerate stored `agent_id`, `project`, and `session_id` scopes |
+| `timeline` | Build a chronological memory view for a node, query, or tenant |
+| `list_conflicts` | List unresolved contradiction and update edges |
+| `resolve_conflict` | Mark a contradiction or update edge as resolved without deleting history |
 | `update_node` | Update content or tags on an existing node |
 | `delete_node` | Remove a node and all its edges |
 | `decompose_and_store` | Break long content into atomic nodes automatically |
@@ -252,7 +306,12 @@ Under the hood, every call runs a **Pydantic-validated LLM extraction pass** (wi
 | `get_stats` | Node/edge counts and most-connected nodes |
 | `export_graph_html` | Interactive browser visualization |
 | `export_graph_backup` | Portable JSON backup |
+| `export_context_bundle` | Export Markdown/JSON context packs for handing memory to another AI |
 | `import_graph_backup` | Restore from a JSON backup |
+
+Most ingestion and retrieval tools also accept optional `agent_id`, `project`, and `session_id` fields so you can keep one tenant’s memory sliced by workspace, agent, or session without spinning up separate databases.
+
+See [Portable context handoff](#portable-context-handoff) for details on `export_context_bundle`.
 
 ---
 
@@ -260,21 +319,10 @@ Under the hood, every call runs a **Pydantic-validated LLM extraction pass** (wi
 
 All numbers below are reproducible from the checked-in fixtures in `benchmarks/fixtures/` using the harness at [`scripts/benchmark_extraction.py`](./scripts/benchmark_extraction.py). Saved output artifacts live in [`tests/artifacts/`](./tests/artifacts/README.md).
 
-**One command produces all the tables below** (extraction regex baseline, retrieval, dedup, and the comparative token-efficiency pilot):
+**One command produces all the tables below** (deterministic extraction, retrieval, dedup, and the comparative token-efficiency pilot):
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/benchmark_extraction.py \
-  --extraction-backend regex \
-  --systems waggle rag_naive \
-  --output tests/artifacts/benchmark_current.json
-```
-
-The LLM extraction row (75%) requires a separate run with a local Ollama instance — it is not included in `benchmark_current.json`:
-
-```bash
-# Requires Ollama running locally with qwen2.5:7b pulled
-PYTHONPATH=src .venv/bin/python scripts/benchmark_extraction.py \
-  --extraction-backend llm --ollama-model qwen2.5:7b --ollama-timeout-seconds 30
+.venv/bin/python scripts/benchmark_extraction.py --output tests/artifacts/benchmark_current.json
 ```
 
 
@@ -284,8 +332,7 @@ Corpus: 12 dialogue pairs covering simple recall, interruptions, reversals, vagu
 
 | Backend | Cases | Accuracy |
 |---------|-------|----------|
-| Regex (fallback) | 12 | 33% |
-| LLM (`qwen2.5:7b`, 30 s timeout) | 12 | 75% |
+| Deterministic conversation parser | 12 | 50% |
 
 ### Retrieval accuracy
 
@@ -301,33 +348,33 @@ Corpus: 18 nodes, 18 queries — 6 easy (direct paraphrase) and 12 hard (adversa
 
 *The retrieval accuracy table above measures Waggle's standalone search quality. The comparison below uses a separate multi-session corpus designed to test token efficiency against a chunked-vector baseline.*
 
-Corpus: 24 multi-session scenarios, 66 retrieval queries across 7 task families (`benchmarks/fixtures/comparative_eval.json`).
+Corpus: 27 multi-session scenarios, 66 retrieval queries across 7 task families (`benchmarks/fixtures/comparative_eval.json`).
 
 | Task family | Queries | Waggle Hit@k | RAG Hit@k |
 |-------------|---------|-------------|----------|
 | `factual_recall` | 18 | 18/18 = 100% | 100% |
 | `temporal_original` | 19 | 17/19 = 89% | 100% |
 | `multi_session_change` | 11 | 10/11 = 91% | 100% |
-| `cross_scenario_synthesis` | 8 | 8/8 = 100% | 100% |
+| `cross_scenario_synthesis` | 8 | 7/8 = 88% | 100% |
 | `decision_delta` | 4 *(small n)* | 4/4 = 100% | 100% |
-| `adversarial_paraphrase` | 4 *(small n)* | 2/4 = 50% | 100% |
+| `adversarial_paraphrase` | 4 *(small n)* | 1/4 = 25% | 100% |
 | `temporal_latest` | 2 *(small n)* | 1/2 = 50% | 100% |
-| **Overall** | **66** | **60/66 = 91%** | **100%** |
+| **Overall** | **66** | **58/66 = 88%** | **100%** |
 
 | System | Mean tokens | Median tokens | p95 tokens | Hit@k | Exact support |
 |--------|-------------|---------------|------------|-------|---------------|
-| **Waggle** | **36.9** | **37.0** | **42.0** | 91% | 74% |
-| Naive chunked-vector RAG | 152.8 | 155.0 | 162.8 | 100% | 100% |
+| **Waggle** | **37.7** | **38.0** | **45.0** | 88% | 73% |
+| Naive chunked-vector RAG | 150.2 | 149.0 | 161.0 | 100% | 98% |
 
 **Waggle uses ~4× fewer tokens per retrieval** than the naive chunked baseline on this corpus.
 
-The gap between Waggle's Hit@k (91%) and exact support (74%) has been significantly improved through **implemented graph-native context assembly** (not chunk retrieval) with weighted traversal, support bundling, and structured priming. The system now automatically:
+The graph-native context assembly work below targets the remaining gap between Waggle's Hit@k (88%) and exact support (73%). The system now automatically:
 - Co-surfaces decision + reason nodes (dependency coverage)
 - Includes both old and new decisions when contradictions are found (conflict symmetry)
 - Traverses multi-hop reasoning chains while pruning weak paths (noise resistance)
 - Ranks nodes by relationship type, not just similarity (semantic priority)
 
-**Measurable improvement: Exact support 74% → 88%** (via relation-aware bundling)
+The dedicated context-assembly suite below passes, but the larger comparative corpus still exposes misses on adversarial paraphrase and some cross-scenario synthesis queries. That tradeoff is reflected in the saved artifact rather than hidden.
 
 ### Context Assembly Validation (NEW)
 
@@ -342,12 +389,25 @@ These improvements are validated in the dedicated benchmark suite (`run_context_
 
 The tradeoff is honest: the chunked baseline achieves 100% Hit@k on this corpus because at `top_k=5` every fact is retrievable from its own session chunk. The token efficiency advantage is real and reproducible; the retrieval superiority claim requires a corpus where chunk coverage can't compensate for missing relational context. Corpus hardening is ongoing.
 
+### Query Stress Eval (NEW)
 
-### When extraction fails
+The system was also tested on a pure query stress evaluation corpus containing 40 adversarial cases across `adversarial_paraphrase` and `temporal_latest` task families:
+
+> **Methodology note:** The comparative corpus above is an end-to-end evaluation: raw conversation → extraction → graph construction → retrieval. Its failures include extraction misses, not just retrieval misses. The Query Stress Eval below pre-loads a known graph and tests retrieval in isolation against 40 adversarial queries, with extraction removed as a variable. The gap between these two evaluations shows that retrieval quality is strong (98%) but end-to-end accuracy is bottlenecked by extraction. Improving the deterministic parser is the next priority.
+
+| System | Hit@k | Exact support | Mean tokens |
+|--------|-------|---------------|-------------|
+| graph_raw | 98% | 98% | 37.0 |
+| graph_hybrid | 98% | 98% | 63.9 |
+
+This demonstrates that against more complex retrieval targets specifically crafted to break generic keyword/vector chunk systems, the raw semantic graph traversal retains an incredibly high 98% Hit@k profile with very minimal token burn.
+
+
+### When extraction is ambiguous
 
 > **User:** "Yeah, let's just do that thing we talked about."
 
-The LLM assigns low confidence (`confidence < 0.5`) to ambiguous input; Waggle **drops the extraction silently** rather than storing a guess. The pipeline does **not** silently fall back to regex on timeout — backend failures surface as explicit errors that are logged.
+The deterministic extractor ignores vague turns like this rather than storing a guess. Waggle only persists content that resolves to a concrete fact, decision, preference, entity, concept, question, or note.
 
 <details>
 <summary>Deduplication results (22-pair fixture — click to expand)</summary>
@@ -365,13 +425,23 @@ The pipeline runs five layers:
    - Jaccard-boosted path: word overlap ≥ 0.35 AND cosine ≥ (type threshold − 0.05)
    - Conservative global fallback
 
-Best measured: **18/22 = 82%** at threshold 0.82. **fp=0 across all thresholds** — no false-friend merges at any tested threshold.
+Best measured: **17/22 = 77%** at threshold 0.82. **fp=0 across all thresholds** — no false-friend merges at any tested threshold.
 
 The remaining 4 false-negatives are pure-paraphrase pairs with no recognisable entity anchor ("user prefers dark mode" / "user wants dark mode UI", "async non-negotiable" / "concurrent without blocking"). These require either semantic similarity fine-tuning or a learned paraphrase classifier to close.
 
 Full threshold sweep and detailed methodology: [`tests/artifacts/README.md`](./tests/artifacts/README.md).
 
 </details>
+
+### External benchmark evaluation
+
+A LongMemEval exploratory adapter has been built and supports two currently implemented evaluation modes plus one planned reranked mode:
+
+- `graph_raw` — graph retrieval only, no LLM
+- `graph_hybrid` — graph retrieval plus deterministic query expansion and temporal boosts
+- `graph_reranked` — planned lightweight LLM reranking mode for external comparison
+
+Baseline results will be published here once the exploratory run is complete. No threshold claims are made until real numbers are measured.
 
 > Full artifacts, methodology, and rag_tuned comparison: [`tests/artifacts/README.md`](./tests/artifacts/README.md)  
 > Improvement roadmap (dedup → context assembly → corpus hardening): [`docs/evaluation-plan.md`](./docs/evaluation-plan.md)
@@ -398,60 +468,25 @@ Most memory systems answer "what do you know about X?" — but can't answer
 
 ## Testing
 
-Beyond empirical benchmarks, `waggle-mcp` ships with a comprehensive pytest suite covering both memory logic and server protocols. This guarantees core behaviours — multi-tenant isolation, conflict detection, semantic deduplication, MCP protocol handling, and explicit LLM backend failure — remain stable across updates.
+Beyond empirical benchmarks, `waggle-mcp` ships with a comprehensive pytest suite covering both memory logic and server protocols. This guarantees core behaviours — multi-tenant isolation, conflict detection, semantic deduplication, scoped retrieval, context bundle export, and MCP protocol handling — remain stable across updates.
 
 <details>
-<summary>View the 43 component and integration tests (click to expand)</summary>
+<summary>View a recent pytest run on the latest branch (click to expand)</summary>
 
 ```text
 ============================= test session starts ==============================
-collected 43 items                                                             
+collected 70 items
 
-tests/test_benchmark_harness.py::test_fixture_loading_is_auditable PASSED
-tests/test_benchmark_harness.py::test_benchmark_report_includes_backend_labels_and_case_counts PASSED
-tests/test_benchmark_harness.py::test_markdown_summary_includes_comparative_systems PASSED
-tests/test_benchmark_harness.py::test_llm_benchmark_failure_is_explicit PASSED
-tests/test_benchmark_harness.py::test_dedup_threshold_sweep_tracks_positive_and_negative_cases PASSED
-tests/test_embeddings.py::test_embedding_bytes_round_trip PASSED
-tests/test_embeddings.py::test_cosine_similarity_handles_orthogonal_vectors PASSED
-tests/test_graph.py::test_add_query_and_related PASSED
-tests/test_graph.py::test_update_delete_and_stats PASSED
-tests/test_graph.py::test_exact_duplicate_nodes_are_reused_and_tags_are_merged PASSED
-tests/test_graph.py::test_semantic_duplicate_nodes_reuse_existing_entry PASSED
-tests/test_graph.py::test_entity_resolution_reuses_acronym_matches PASSED
-tests/test_graph.py::test_query_ranking_uses_label_lexical_overlap PASSED
-tests/test_graph.py::test_decompose_and_store_creates_nodes_and_edges PASSED
-tests/test_graph.py::test_export_and_import_backup_round_trip PASSED
-tests/test_graph.py::test_export_graph_html_creates_visualization_file PASSED
-tests/test_graph.py::test_conflict_detection_creates_contradiction_edge PASSED
-tests/test_graph.py::test_observe_conversation_extracts_nodes PASSED
-tests/test_graph.py::test_query_supports_temporal_latest_and_oldest_bias PASSED
-tests/test_graph.py::test_graph_diff_and_prime_context PASSED
-tests/test_graph.py::test_get_topics_returns_clusters PASSED
-tests/test_platform.py::test_api_key_hashing_round_trip PASSED
-tests/test_platform.py::test_rate_limiter_enforces_request_and_concurrency_limits PASSED
-tests/test_platform.py::test_tenant_scoping_isolated_within_same_sqlite_database PASSED
-tests/test_platform.py::test_backup_round_trip_preserves_schema_and_tenant_metadata PASSED
-tests/test_platform.py::test_http_app_health_auth_and_metrics PASSED
-tests/test_platform.py::test_http_app_rate_limit_and_payload_limit PASSED
-tests/test_server.py::test_store_node_and_stats_tool PASSED
-tests/test_server.py::test_export_graph_html_tool PASSED
-tests/test_server.py::test_decompose_and_store_tool_persists_subgraph PASSED
-tests/test_server.py::test_export_and_import_backup_tools PASSED
-tests/test_server.py::test_store_node_reports_deduplication PASSED
-tests/test_server.py::test_store_node_reports_conflicts PASSED
-tests/test_server.py::test_observe_conversation_tool PASSED
-tests/test_server.py::test_graph_diff_prime_context_and_topics_tools PASSED
-tests/test_server.py::test_recent_resource_serialization PASSED
-tests/test_server.py::test_unknown_tool_raises PASSED
-tests/test_server.py::test_invalid_tool_inputs_return_structured_errors PASSED
-tests/test_server.py::test_tool_payload_limit_is_enforced PASSED
-tests/test_server.py::test_default_graph_uses_sqlite_backend_by_default PASSED
-tests/test_server.py::test_default_graph_can_build_neo4j_backend PASSED
-tests/test_server.py::test_default_graph_requires_neo4j_connection_settings PASSED
-tests/test_stdio_integration.py::test_server_stdio_initialize_and_basic_calls PASSED
+tests/test_benchmark_harness.py .....
+tests/test_embeddings.py ....
+tests/test_graph.py ........................
+tests/test_packaging_metadata.py ..
+tests/test_platform.py ......
+tests/test_server.py ........................
+tests/test_stdio_integration.py .
+tests/test_longmemeval_benchmark.py .
 
-============================== 43 passed in 4.92s ==============================
+============================== 70 passed in 5.70s ==============================
 ```
 </details>
 
@@ -467,6 +502,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 waggle-mcp init        # ← writes your client config automatically
 ```
+
+If `.venv` already exists from a different Python version, remove it first and recreate it. Reusing a stale environment can leave the wrapper scripts pointing at the wrong interpreter.
 
 Key variables for local mode:
 
@@ -501,6 +538,9 @@ waggle-mcp
 ```bash
 docker build -t waggle-mcp:latest .
 
+# CLI arguments pass through to the module entrypoint
+docker run --rm waggle-mcp:latest --help
+
 docker run --rm -p 8080:8080 \
   -e WAGGLE_TRANSPORT=http \
   -e WAGGLE_BACKEND=neo4j \
@@ -525,7 +565,6 @@ docker run --rm -p 8080:8080 \
       "command": "/path/to/.venv/bin/python",
       "args": ["-m", "waggle.server"],
       "env": {
-        "PYTHONPATH": "/path/to/waggle-mcp/src",
         "WAGGLE_TRANSPORT": "stdio",
         "WAGGLE_BACKEND": "sqlite",
         "WAGGLE_DB_PATH": "~/.waggle/memory.db",
@@ -543,9 +582,7 @@ docker run --rm -p 8080:8080 \
 [mcp_servers.waggle]
 command = "/path/to/.venv/bin/python"
 args    = ["-m", "waggle.server"]
-cwd     = "/path/to/waggle-mcp"
 env     = {
-  PYTHONPATH                     = "/path/to/waggle-mcp/src",
   WAGGLE_TRANSPORT         = "stdio",
   WAGGLE_BACKEND           = "sqlite",
   WAGGLE_DB_PATH           = "~/.waggle/memory.db",
@@ -603,15 +640,9 @@ A pre-filled example is in [`codex_config.example.toml`](./codex_config.example.
 | `WAGGLE_NEO4J_PASSWORD` | Neo4j password |
 | `WAGGLE_NEO4J_DATABASE` | Neo4j database name |
 
-### LLM Extraction
+### Conversation Extraction
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WAGGLE_EXTRACT_BACKEND` | `auto` | `auto` \| `llm` \| `regex` |
-| `WAGGLE_EXTRACT_MODEL` | `mistral` | Ollama model name |
-| `WAGGLE_EXTRACT_MIN_CONFIDENCE` | `0.5` | float 0–1, facts below this are dropped |
-| `WAGGLE_OLLAMA_URL` | `http://localhost:11434` | Base URL for local Ollama |
-| `WAGGLE_OLLAMA_TIMEOUT_SECONDS` | `15` | Timeout in seconds for Ollama requests; used by extractor and benchmark harness |
+No extra extraction runtime is required. `observe_conversation` uses the built-in deterministic parser and stores only structured facts that map cleanly onto Waggle node types.
 
 </details>
 
@@ -702,15 +733,15 @@ waggle-mcp/
 
 **Retrieval & assembly** ✅ — Completed. Relation-aware context assembly now automatically bundles supporting context (decisions + reasons, old + new decisions with updates, full dependency chains), with all benchmarks passing.
 
-**Extraction & relation quality** 🎯 — Next frontier. After assembly improvements, the system's weak link is now extraction accuracy and relation inference:
-- Extraction confidence: currently 33% (regex), 75% (LLM with timeout). Improving LLM extraction and confidence thresholding will yield better graph quality.
-- Relation types: Currently using 7 fixed types. Opportunity to infer richer relationships (e.g., `blocks`, `enables`, `requires`, `conflicts_with`) from conversation context.
-- Edge quality: Better temporal ordering and provenance tracking; structured rationale for why a relation was inferred.
+**Extraction quality** 🎯 — Current bottleneck. The deterministic parser scores 50% on the 12-case extraction corpus. Retrieval in isolation scores 98% on the stress eval, confirming the graph engine is strong but upstream extraction limits end-to-end accuracy.
 
 Planned improvements:
-- Fine-tune extraction LLM on Waggle corpus (decision/preference/fact/concept patterns in real conversations)
-- Add `ConversationContext` to relation inference (sentence proximity, sentiment, coreference resolution)
+- Improve the deterministic parser's coverage of reversals, hedged statements, and multi-fact sentences
+- Add `ConversationContext` to relation inference (sentence proximity, coreference)
 - Introduce structured `RichEdge` with proof snippets and confidence scores
+- Expand edge type vocabulary beyond the current 7 fixed types
+
+**External benchmarks** 🔜 — A LongMemEval exploratory adapter is built and ready to run. Results will be published here once the baseline evaluation is complete.
 
 ---
 

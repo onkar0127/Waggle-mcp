@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from waggle.models import (
+    ConflictEntry,
+    ConflictListResult,
+    ContextBundleExportResult,
     GraphDiffResult,
     GraphStats,
+    NodeHistoryResult,
     Node,
     ObservationResult,
     PrimeContextResult,
     SubgraphResult,
+    TimelineResult,
     TopicResult,
 )
 
@@ -110,6 +115,109 @@ def serialize_observation_result(result: ObservationResult) -> str:
         for conflict in result.conflicts:
             lines.append(f'• "{conflict.other_node_label}" — {conflict.reason}')
     lines.append("=== End Observation ===")
+    return "\n".join(lines)
+
+
+def serialize_node_history(result: NodeHistoryResult) -> str:
+    node = result.node
+    lines = [
+        "=== Node History ===",
+        f'Node: "{node.label}" [{node.node_type.value}]',
+        f"Evidence records: {len(node.evidence_records)}",
+    ]
+    if node.valid_from or node.valid_to:
+        lines.append(
+            f"Validity: {node.valid_from.isoformat() if node.valid_from else 'open'} -> "
+            f"{node.valid_to.isoformat() if node.valid_to else 'open'}"
+        )
+    if node.evidence_records:
+        lines.extend(["", "[EVIDENCE]"])
+        for record in node.evidence_records[:5]:
+            lines.append(
+                f'• ({record.source_role or "unknown"} turn {record.turn_index}) '
+                f'{record.source_text or node.content}'
+            )
+    lines.extend(["", "[RELATED NODES]"])
+    if result.related_nodes:
+        for related in result.related_nodes:
+            lines.append(f'• [{related.node_type.value}] "{related.label}"')
+    else:
+        lines.append("• No related nodes.")
+    lines.append("=== End Node History ===")
+    return "\n".join(lines)
+
+
+def serialize_timeline(result: TimelineResult) -> str:
+    lines = [
+        "=== Timeline ===",
+        f"Scope: {result.scope or 'tenant'}",
+        f"Items: {len(result.items)}",
+    ]
+    if result.items:
+        lines.extend(["", "[ITEMS]"])
+        for item in result.items:
+            anchor = f" node={item.node_id[:8]}" if item.node_id else ""
+            edge = f" edge={item.edge_id[:8]}" if item.edge_id else ""
+            lines.append(
+                f"• {item.timestamp.isoformat()} [{item.kind}] {item.label} — {item.summary}{anchor}{edge}"
+            )
+    else:
+        lines.append("No timeline items.")
+    lines.append("=== End Timeline ===")
+    return "\n".join(lines)
+
+
+def serialize_conflict_entry(entry: ConflictEntry) -> str:
+    lines = [
+        "=== Conflict Entry ===",
+        f'Conflict: "{entry.source_node.label}" --[{entry.edge.relationship.value}]--> "{entry.target_node.label}"',
+        f"Resolved: {'yes' if entry.resolved else 'no'}",
+    ]
+    if entry.resolution_note:
+        lines.append(f"Resolution note: {entry.resolution_note}")
+    if entry.resolved_at is not None:
+        lines.append(f"Resolved at: {entry.resolved_at.isoformat()}")
+    lines.append("=== End Conflict Entry ===")
+    return "\n".join(lines)
+
+
+def serialize_conflicts(result: ConflictListResult) -> str:
+    lines = [
+        "=== Conflicts ===",
+        f"Include resolved: {'yes' if result.include_resolved else 'no'}",
+        f"Conflicts: {len(result.conflicts)}",
+    ]
+    if result.conflicts:
+        lines.extend(["", "[CONFLICTS]"])
+        for entry in result.conflicts:
+            resolved_suffix = " resolved" if entry.resolved else " unresolved"
+            lines.append(
+                f'• "{entry.source_node.label}" --[{entry.edge.relationship.value}]--> '
+                f'"{entry.target_node.label}" ({resolved_suffix.strip()})'
+            )
+    else:
+        lines.append("No matching conflicts.")
+    lines.append("=== End Conflicts ===")
+    return "\n".join(lines)
+
+
+def serialize_context_bundle_export(result: ContextBundleExportResult) -> str:
+    lines = [
+        "=== Context Bundle Export ===",
+        f"Mode: {result.mode}",
+        f"Tenant: {result.tenant_id}",
+        f"Project: {result.project or 'n/a'}",
+        f"Query: {result.query or 'n/a'}",
+        f"Nodes: {result.node_count}",
+        f"Edges: {result.edge_count}",
+    ]
+    if result.markdown_path:
+        lines.append(f"Markdown: {result.markdown_path}")
+    if result.json_path:
+        lines.append(f"JSON: {result.json_path}")
+    if result.summary:
+        lines.extend(["", result.summary])
+    lines.append("=== End Context Bundle Export ===")
     return "\n".join(lines)
 
 

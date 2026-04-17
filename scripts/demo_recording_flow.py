@@ -60,7 +60,6 @@ def build_env(db_path: Path) -> dict[str, str]:
     env["WAGGLE_EXPORT_DIR"] = str(EXPORT_DIR)
     env["WAGGLE_LOG_LEVEL"] = "ERROR"
     env.setdefault("WAGGLE_MODEL", "fake-model")
-    env.setdefault("WAGGLE_EXTRACT_BACKEND", "regex")
     return env
 
 

@@ -11,7 +11,6 @@ LABEL org.opencontainers.image.title="waggle-mcp" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app/src \
     WAGGLE_TRANSPORT=stdio \
     WAGGLE_BACKEND=sqlite \
     WAGGLE_DB_PATH=memory.db \
@@ -43,4 +42,5 @@ USER waggle
 # Only bound when WAGGLE_TRANSPORT=http
 EXPOSE 8080
 
-CMD ["waggle-mcp"]
+ENTRYPOINT ["python", "-m", "waggle.server"]
+CMD ["serve"]

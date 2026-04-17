@@ -36,11 +36,17 @@ class RelationType(str, Enum):
 class Node(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     tenant_id: str = ""
+    agent_id: str = ""
+    project: str = ""
+    session_id: str = ""
     label: str
     content: str
     node_type: NodeType
     tags: list[str] = Field(default_factory=list)
     source_prompt: str = ""
+    evidence_records: list["EvidenceRecord"] = Field(default_factory=list)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     access_count: int = 0
@@ -62,6 +68,13 @@ class Node(BaseModel):
             return ""
         return str(value).strip()
 
+    @field_validator("agent_id", "project", "session_id", mode="before")
+    @classmethod
+    def _normalize_scope_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
     @field_validator("tags", mode="before")
     @classmethod
     def _normalize_tags(cls, value: Any) -> list[str]:
@@ -79,6 +92,24 @@ class Node(BaseModel):
             normalized.append(text)
             seen.add(text)
         return normalized
+
+
+class EvidenceRecord(BaseModel):
+    evidence_id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str = ""
+    turn_index: int = 0
+    source_role: str = ""
+    source_text: str = ""
+    source_span_start: int | None = None
+    source_span_end: int | None = None
+    observed_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("session_id", "source_role", "source_text", mode="before")
+    @classmethod
+    def _normalize_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
 
 
 class Edge(BaseModel):
@@ -184,6 +215,83 @@ class PrimeContextResult(BaseModel):
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     total_nodes_in_graph: int = 0
+
+
+class NodeHistoryResult(BaseModel):
+    node: Node
+    related_nodes: list[Node] = Field(default_factory=list)
+    edges: list[Edge] = Field(default_factory=list)
+
+
+class ContextTimelineItem(BaseModel):
+    kind: str
+    timestamp: datetime
+    label: str
+    summary: str = ""
+    node_id: str | None = None
+    edge_id: str | None = None
+
+
+class TimelineResult(BaseModel):
+    scope: str = ""
+    items: list["ContextTimelineItem"] = Field(default_factory=list)
+
+
+class ConflictEntry(BaseModel):
+    edge: Edge
+    source_node: Node
+    target_node: Node
+    resolved: bool = False
+    resolution_note: str = ""
+    resolved_at: datetime | None = None
+
+
+class ConflictListResult(BaseModel):
+    conflicts: list[ConflictEntry] = Field(default_factory=list)
+    include_resolved: bool = False
+
+
+class ContextScopeResult(BaseModel):
+    agent_ids: list[str] = Field(default_factory=list)
+    projects: list[str] = Field(default_factory=list)
+    session_ids: list[str] = Field(default_factory=list)
+
+
+class ContextRenderHints(BaseModel):
+    token_estimate: int = 0
+    recommended_paste_order: list[str] = Field(default_factory=list)
+    truncation_flags: list[str] = Field(default_factory=list)
+    chunk_count: int = 1
+
+
+class ContextBundle(BaseModel):
+    schema_version: int = 1
+    export_type: str = "context_bundle"
+    generated_at: datetime = Field(default_factory=utc_now)
+    tenant_id: str = ""
+    project: str = ""
+    mode: str = "prime"
+    audience: str = "llm"
+    query: str = ""
+    summary: str = ""
+    nodes: list[Node] = Field(default_factory=list)
+    edges: list[Edge] = Field(default_factory=list)
+    timeline: list[ContextTimelineItem] = Field(default_factory=list)
+    stats: GraphStats = Field(default_factory=GraphStats)
+    render_hints: ContextRenderHints = Field(default_factory=ContextRenderHints)
+
+
+class ContextBundleExportResult(BaseModel):
+    tenant_id: str = ""
+    project: str = ""
+    mode: str = "prime"
+    query: str = ""
+    summary: str = ""
+    markdown_path: str | None = None
+    json_path: str | None = None
+    node_count: int = 0
+    edge_count: int = 0
+    bundle: ContextBundle
 
 
 class TopicCluster(BaseModel):

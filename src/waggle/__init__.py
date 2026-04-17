@@ -1,16 +1,27 @@
 """Persistent graph memory MCP server."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from waggle.graph import MemoryGraph
 from waggle.models import (
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
+    ConflictEntry,
+    ConflictListResult,
     ConflictRecord,
+    ContextBundle,
+    ContextBundleExportResult,
+    ContextRenderHints,
+    ContextScopeResult,
+    ContextTimelineItem,
     Edge,
+    EvidenceRecord,
     GraphDiffResult,
     GraphStats,
     ImportResult,
     Node,
+    NodeHistoryResult,
     NodeStoreResult,
     NodeType,
     ObservationResult,
@@ -18,6 +29,7 @@ from waggle.models import (
     RelationType,
     SubgraphResult,
     TenantRecord,
+    TimelineResult,
     TopicCluster,
     TopicResult,
 )
@@ -32,13 +44,22 @@ __all__ = [
     "ApiKeyCreateResult",
     "ApiKeyRecord",
     "BackupResult",
+    "ConflictEntry",
+    "ConflictListResult",
     "ConflictRecord",
+    "ContextBundle",
+    "ContextBundleExportResult",
+    "ContextRenderHints",
+    "ContextScopeResult",
+    "ContextTimelineItem",
     "GraphStats",
     "GraphDiffResult",
+    "EvidenceRecord",
     "ImportResult",
     "MemoryGraph",
     "Neo4jMemoryGraph",
     "Node",
+    "NodeHistoryResult",
     "NodeStoreResult",
     "NodeType",
     "ObservationResult",
@@ -46,8 +67,12 @@ __all__ = [
     "RelationType",
     "SubgraphResult",
     "TenantRecord",
+    "TimelineResult",
     "TopicCluster",
     "TopicResult",
 ]
 
-__version__ = "0.1.0"
+try:  # pragma: no cover
+    __version__ = version("waggle-mcp")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.1.3"

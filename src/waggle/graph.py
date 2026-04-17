@@ -15,9 +15,10 @@ import networkx as nx
 import numpy as np
 
 from waggle.auth import generate_api_key, hash_api_key, verify_api_key
+from waggle.context_bundle import build_context_bundle, export_context_bundle_files
 from waggle.embeddings import EmbeddingModel
+from waggle.evidence import build_observation_evidence, merge_evidence_records, merge_validity_windows
 from waggle.errors import AuthenticationError, ValidationFailure
-from waggle.extractor import EXTRACT_BACKEND, extract_with_llm
 from waggle.intelligence import (
     compatible_node_types,
     contains_conflicting_numbers,
@@ -46,13 +47,20 @@ from waggle.models import (
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
+    ConflictEntry,
+    ConflictListResult,
     ConflictRecord,
     ConnectedNodeStat,
+    ContextBundleExportResult,
+    ContextScopeResult,
+    ContextTimelineItem,
     Edge,
+    EvidenceRecord,
     GraphDiffResult,
     GraphStats,
     ImportResult,
     Node,
+    NodeHistoryResult,
     NodeStoreResult,
     NodeType,
     ObservationResult,
@@ -61,6 +69,7 @@ from waggle.models import (
     RelationType,
     SubgraphResult,
     TenantRecord,
+    TimelineResult,
     TopicCluster,
     TopicResult,
     utc_now,
@@ -131,6 +140,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL DEFAULT 'local-default',
+    agent_id TEXT DEFAULT '',
+    project TEXT DEFAULT '',
+    session_id TEXT DEFAULT '',
     label TEXT NOT NULL,
     content TEXT NOT NULL,
     node_type TEXT NOT NULL CHECK(
@@ -139,6 +151,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     tags TEXT DEFAULT '[]',
     embedding BLOB,
     source_prompt TEXT DEFAULT '',
+    evidence_records TEXT DEFAULT '[]',
+    valid_from TEXT DEFAULT NULL,
+    valid_to TEXT DEFAULT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     access_count INTEGER DEFAULT 0
@@ -195,6 +210,45 @@ def _parse_datetime(raw: str) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _encode_evidence_records(records: list[EvidenceRecord]) -> str:
+    return json.dumps([record.model_dump(mode="json") for record in records], sort_keys=True)
+
+
+def _decode_evidence_records(raw: Any) -> list[EvidenceRecord]:
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, list):
+        return [EvidenceRecord.model_validate(item) for item in raw]
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(decoded, list):
+            return []
+        return [EvidenceRecord.model_validate(item) for item in decoded]
+    return []
+
+
+def _scope_matches(node: Node, *, agent_id: str = "", project: str = "", session_id: str = "") -> bool:
+    normalized_agent = agent_id.strip().lower()
+    normalized_project = project.strip().lower()
+    normalized_session = session_id.strip().lower()
+    if normalized_agent and node.agent_id.strip().lower() != normalized_agent:
+        return False
+    if normalized_session and node.session_id.strip().lower() != normalized_session:
+        return False
+    if normalized_project:
+        project_tags = {str(tag).strip().lower() for tag in node.tags}
+        if node.project.strip().lower() != normalized_project and normalized_project not in project_tags and f"project:{normalized_project}" not in project_tags:
+            return False
+    return True
+
+
+def _merge_scope_value(existing: str, incoming: str) -> str:
+    return existing.strip() or incoming.strip()
 
 
 class MemoryGraph:
@@ -371,6 +425,18 @@ class MemoryGraph:
                 f"ALTER TABLE nodes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '{self.tenant_id}'"
             )
             connection.execute("UPDATE nodes SET tenant_id = ? WHERE tenant_id = ''", (self.tenant_id,))
+        if "evidence_records" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN evidence_records TEXT DEFAULT '[]'")
+        if "valid_from" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN valid_from TEXT DEFAULT NULL")
+        if "valid_to" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN valid_to TEXT DEFAULT NULL")
+        if "agent_id" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN agent_id TEXT DEFAULT ''")
+        if "project" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN project TEXT DEFAULT ''")
+        if "session_id" not in node_columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN session_id TEXT DEFAULT ''")
         if "tenant_id" not in edge_columns:
             connection.execute(
                 f"ALTER TABLE edges ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '{self.tenant_id}'"
@@ -392,14 +458,26 @@ class MemoryGraph:
         node_type: NodeType,
         tags: list[str] | None = None,
         source_prompt: str = "",
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+        evidence_records: list[EvidenceRecord] | None = None,
+        valid_from: datetime | None = None,
+        valid_to: datetime | None = None,
     ) -> NodeStoreResult:
         node = Node(
             tenant_id=self.tenant_id,
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
             label=label,
             content=content,
             node_type=node_type,
             tags=tags or [],
             source_prompt=source_prompt,
+            evidence_records=evidence_records or [],
+            valid_from=valid_from,
+            valid_to=valid_to,
         )
         embedding = self.embedding_model.embed(node.content)
 
@@ -422,20 +500,27 @@ class MemoryGraph:
             connection.execute(
                 """
                 INSERT INTO nodes (
-                    id, tenant_id, label, content, node_type, tags, embedding,
-                    source_prompt, created_at, updated_at, access_count
+                    id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, embedding,
+                    source_prompt, evidence_records, valid_from, valid_to,
+                    created_at, updated_at, access_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     node.id,
                     node.tenant_id,
+                    node.agent_id,
+                    node.project,
+                    node.session_id,
                     node.label,
                     node.content,
                     node.node_type.value,
                     json.dumps(node.tags),
                     self.embedding_model.to_bytes(embedding),
                     node.source_prompt,
+                    _encode_evidence_records(node.evidence_records),
+                    node.valid_from.isoformat() if node.valid_from is not None else None,
+                    node.valid_to.isoformat() if node.valid_to is not None else None,
                     node.created_at.isoformat(),
                     node.updated_at.isoformat(),
                     node.access_count,
@@ -500,7 +585,147 @@ class MemoryGraph:
                 raise ValueError(f"Node not found: {node_id}")
             return self._row_to_node(row)
 
-    def query(self, *, query: str, max_nodes: int = 20, max_depth: int = 2) -> SubgraphResult:
+    def get_node_history(self, *, node_id: str, max_depth: int = 2) -> NodeHistoryResult:
+        node = self.get_node(node_id)
+        related = self.get_related(node_id=node_id, max_depth=max_depth)
+        related_nodes = [item for item in related.nodes if item.id != node_id]
+        return NodeHistoryResult(node=node, related_nodes=related_nodes, edges=related.edges)
+
+    def timeline(
+        self,
+        *,
+        node_id: str = "",
+        query: str = "",
+        limit: int = 25,
+        max_depth: int = 2,
+        include_evidence: bool = True,
+    ) -> TimelineResult:
+        if limit < 1:
+            raise ValueError("limit must be at least 1.")
+        if max_depth < 0:
+            raise ValueError("max_depth cannot be negative.")
+        if node_id.strip() and query.strip():
+            raise ValueError("Provide either node_id or query, not both.")
+
+        if node_id.strip():
+            related = self.get_related(node_id=node_id, max_depth=max_depth)
+            nodes = related.nodes
+            edges = related.edges
+            scope = f"node:{node_id.strip()}"
+        elif query.strip():
+            subgraph = self.query(query=query, max_nodes=max(limit, 10), max_depth=max_depth)
+            nodes = subgraph.nodes
+            edges = subgraph.edges
+            scope = f"query:{query.strip()}"
+        else:
+            with self._lock, self._connect() as connection:
+                nodes = self.list_recent_nodes(limit=max(limit, 10))
+                edges = self._fetch_edges_for_nodes(connection, [node.id for node in nodes])
+            scope = "tenant"
+
+        items = self._build_timeline_items(
+            nodes=nodes,
+            edges=edges,
+            include_evidence=include_evidence,
+            limit=limit,
+        )
+        return TimelineResult(scope=scope, items=items)
+
+    def list_conflicts(
+        self,
+        *,
+        include_resolved: bool = False,
+        limit: int = 25,
+    ) -> ConflictListResult:
+        if limit < 1:
+            raise ValueError("limit must be at least 1.")
+
+        with self._lock, self._connect() as connection:
+            edge_rows = connection.execute(
+                """
+                SELECT id, source_id, target_id, relationship, weight, metadata, created_at, tenant_id
+                FROM edges
+                WHERE tenant_id = ?
+                  AND relationship IN (?, ?)
+                ORDER BY created_at DESC
+                """,
+                (self.tenant_id, RelationType.CONTRADICTS.value, RelationType.UPDATES.value),
+            ).fetchall()
+            edges = [self._row_to_edge(row) for row in edge_rows]
+            entries = self._build_conflict_entries(
+                connection,
+                edges=edges,
+                include_resolved=include_resolved,
+                limit=limit,
+            )
+        return ConflictListResult(conflicts=entries, include_resolved=include_resolved)
+
+    def resolve_conflict(
+        self,
+        *,
+        edge_id: str,
+        resolution_note: str = "",
+    ) -> ConflictEntry:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, source_id, target_id, relationship, weight, metadata, created_at, tenant_id
+                FROM edges
+                WHERE tenant_id = ? AND id = ?
+                LIMIT 1
+                """,
+                (self.tenant_id, edge_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Conflict edge not found: {edge_id}")
+            edge = self._row_to_edge(row)
+            if edge.relationship not in {RelationType.CONTRADICTS, RelationType.UPDATES}:
+                raise ValueError("Only contradicts or updates edges can be resolved.")
+
+            metadata = dict(edge.metadata)
+            metadata["resolved"] = True
+            metadata["resolved_at"] = utc_now().isoformat()
+            if resolution_note.strip():
+                metadata["resolution_note"] = resolution_note.strip()
+
+            connection.execute(
+                """
+                UPDATE edges
+                SET metadata = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (json.dumps(metadata, sort_keys=True), self.tenant_id, edge_id),
+            )
+            updated_edge = Edge(
+                id=edge.id,
+                tenant_id=edge.tenant_id,
+                source_id=edge.source_id,
+                target_id=edge.target_id,
+                relationship=edge.relationship,
+                weight=edge.weight,
+                metadata=metadata,
+                created_at=edge.created_at,
+            )
+            entry = self._build_conflict_entries(
+                connection,
+                edges=[updated_edge],
+                include_resolved=True,
+                limit=1,
+            )
+        if not entry:
+            raise ValueError(f"Resolved conflict could not be loaded: {edge_id}")
+        return entry[0]
+
+    def query(
+        self,
+        *,
+        query: str,
+        max_nodes: int = 20,
+        max_depth: int = 2,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+    ) -> SubgraphResult:
         query_text = query.strip()
         if not query_text:
             raise ValueError("Query cannot be empty.")
@@ -513,8 +738,8 @@ class MemoryGraph:
             temporal_hints = infer_temporal_hints(query_text)
             node_rows = connection.execute(
                 """
-                SELECT id, label, content, node_type, tags, source_prompt,
-                       created_at, updated_at, access_count, embedding
+                SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt,
+                       evidence_records, valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
                 FROM nodes
                 WHERE tenant_id = ? AND embedding IS NOT NULL
                 """
@@ -527,8 +752,13 @@ class MemoryGraph:
             embeddings_by_id: dict[str, np.ndarray] = {}
             for row in node_rows:
                 node = self._row_to_node(row)
+                if not _scope_matches(node, agent_id=agent_id, project=project, session_id=session_id):
+                    continue
                 nodes_by_id[node.id] = node
                 embeddings_by_id[node.id] = self.embedding_model.from_bytes(row["embedding"])
+
+            if not nodes_by_id:
+                return SubgraphResult(query=query_text, total_nodes_in_graph=total_nodes)
 
             query_embedding = self.embedding_model.embed(query_text)
             similarity_by_id = {
@@ -620,8 +850,8 @@ class MemoryGraph:
             self._require_node(connection, node_id)
             node_rows = connection.execute(
                 """
-                SELECT id, label, content, node_type, tags, source_prompt,
-                       created_at, updated_at, access_count
+                SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records, valid_from, valid_to,
+                       created_at, updated_at, access_count, tenant_id
                 FROM nodes
                 WHERE tenant_id = ?
                 """
@@ -678,11 +908,17 @@ class MemoryGraph:
             updated_node = Node(
                 id=node.id,
                 tenant_id=node.tenant_id,
+                agent_id=node.agent_id,
+                project=node.project,
+                session_id=node.session_id,
                 label=updated_label,
                 content=updated_content,
                 node_type=node.node_type,
                 tags=updated_tags,
                 source_prompt=node.source_prompt,
+                evidence_records=node.evidence_records,
+                valid_from=node.valid_from,
+                valid_to=node.valid_to,
                 created_at=node.created_at,
                 updated_at=updated_at,
                 access_count=node.access_count,
@@ -691,7 +927,8 @@ class MemoryGraph:
             connection.execute(
                 """
                 UPDATE nodes
-                SET label = ?, content = ?, tags = ?, embedding = ?, updated_at = ?
+                SET label = ?, content = ?, tags = ?, embedding = ?, updated_at = ?,
+                    agent_id = ?, project = ?, session_id = ?
                 WHERE id = ? AND tenant_id = ?
                 """,
                 (
@@ -700,6 +937,9 @@ class MemoryGraph:
                     json.dumps(updated_node.tags),
                     embedding_bytes,
                     updated_node.updated_at.isoformat(),
+                    updated_node.agent_id,
+                    updated_node.project,
+                    updated_node.session_id,
                     updated_node.id,
                     self.tenant_id,
                 ),
@@ -720,8 +960,8 @@ class MemoryGraph:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, label, content, node_type, tags, source_prompt,
-                       created_at, updated_at, access_count
+                SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records, valid_from, valid_to,
+                       created_at, updated_at, access_count, tenant_id
                 FROM nodes
                 WHERE tenant_id = ?
                 ORDER BY updated_at DESC, created_at DESC
@@ -730,6 +970,21 @@ class MemoryGraph:
                 (self.tenant_id, limit),
             ).fetchall()
             return [self._row_to_node(row) for row in rows]
+
+    def list_context_scopes(self) -> ContextScopeResult:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT agent_id, project, session_id
+                FROM nodes
+                WHERE tenant_id = ?
+                """,
+                (self.tenant_id,),
+            ).fetchall()
+        agent_ids = sorted({str(row["agent_id"]).strip() for row in rows if str(row["agent_id"]).strip()})
+        projects = sorted({str(row["project"]).strip() for row in rows if str(row["project"]).strip()})
+        session_ids = sorted({str(row["session_id"]).strip() for row in rows if str(row["session_id"]).strip()})
+        return ContextScopeResult(agent_ids=agent_ids, projects=projects, session_ids=session_ids)
 
     def get_stats(self) -> GraphStats:
         with self._lock, self._connect() as connection:
@@ -916,6 +1171,113 @@ class MemoryGraph:
             edge_count=len(snapshot["edges"]),
         )
 
+    def export_context_bundle(
+        self,
+        *,
+        mode: str = "prime",
+        query: str = "",
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+        max_nodes: int = 25,
+        max_depth: int = 2,
+        format: str = "both",
+        output_path: str | Path | None = None,
+        include_edges: bool = True,
+        include_timestamps: bool = True,
+        include_source_prompt: bool = False,
+        audience: str = "llm",
+    ) -> ContextBundleExportResult:
+        normalized_mode = mode.strip().lower()
+        normalized_format = format.strip().lower()
+        normalized_audience = audience.strip().lower()
+        if normalized_mode not in {"prime", "query", "graph"}:
+            raise ValidationFailure("mode must be one of: prime, query, graph.")
+        if normalized_format not in {"markdown", "json", "both"}:
+            raise ValidationFailure("format must be one of: markdown, json, both.")
+        if normalized_audience not in {"llm", "human"}:
+            raise ValidationFailure("audience must be one of: llm, human.")
+        if normalized_mode == "query" and not query.strip():
+            raise ValidationFailure("query is required when mode='query'.")
+
+        if normalized_mode == "prime":
+            selected = self.prime_context(project=project, agent_id=agent_id, session_id=session_id, max_nodes=max_nodes)
+            selected_nodes = selected.nodes
+            selected_edges = selected.edges if include_edges else []
+            summary = selected.summary
+        elif normalized_mode == "query":
+            selected = self.query(
+                query=query,
+                max_nodes=max_nodes,
+                max_depth=max_depth,
+                agent_id=agent_id,
+                project=project,
+                session_id=session_id,
+            )
+            selected_nodes = selected.nodes
+            selected_edges = selected.edges if include_edges else []
+            summary = (
+                f"Query context for '{query}' with {len(selected.nodes)} nodes and {len(selected.edges) if include_edges else 0} edges."
+            )
+        else:
+            with self._lock, self._connect() as connection:
+                node_rows = connection.execute(
+                    """
+                    SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt,
+                           evidence_records, valid_from, valid_to, created_at, updated_at, access_count, tenant_id
+                    FROM nodes
+                    WHERE tenant_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    """,
+                    (self.tenant_id,),
+                ).fetchall()
+                edge_rows = connection.execute(
+                    """
+                    SELECT id, source_id, target_id, relationship, weight, metadata, created_at
+                    FROM edges
+                    WHERE tenant_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (self.tenant_id,),
+                ).fetchall()
+            selected_nodes = [
+                node
+                for row in node_rows
+                for node in [self._row_to_node(row)]
+                if _scope_matches(node, agent_id=agent_id, project=project, session_id=session_id)
+            ]
+            selected_edges = [self._row_to_edge(row) for row in edge_rows] if include_edges else []
+            if include_edges:
+                selected_ids = {node.id for node in selected_nodes}
+                selected_edges = [
+                    edge for edge in selected_edges if edge.source_id in selected_ids and edge.target_id in selected_ids
+                ]
+            summary = (
+                f"Full graph export for tenant '{self.tenant_id}' with {len(selected_nodes)} nodes and "
+                f"{len(selected_edges)} edges."
+            )
+
+        bundle = build_context_bundle(
+            tenant_id=self.tenant_id,
+            project=project,
+            mode=normalized_mode,
+            audience=normalized_audience,
+            query=query,
+            summary=summary,
+            nodes=selected_nodes,
+            edges=selected_edges,
+            stats=self.get_stats(),
+        )
+        return export_context_bundle_files(
+            bundle,
+            output_path=output_path,
+            export_dir=self.export_dir,
+            format=normalized_format,
+            include_edges=include_edges,
+            include_timestamps=include_timestamps,
+            include_source_prompt=include_source_prompt,
+        )
+
     def import_graph_backup(self, *, input_path: str | Path) -> ImportResult:
         source = Path(input_path).expanduser()
         snapshot = json.loads(source.read_text(encoding="utf-8"))
@@ -1016,27 +1378,47 @@ class MemoryGraph:
             total_nodes_in_graph=self.get_stats().total_nodes,
         )
 
-    def observe_conversation(self, *, user_message: str, assistant_response: str) -> ObservationResult:
+    def observe_conversation(
+        self,
+        *,
+        user_message: str,
+        assistant_response: str,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+    ) -> ObservationResult:
         transcript = f"user: {user_message.strip()}\nassistant: {assistant_response.strip()}".strip()
-        candidates = None
-        
-        if EXTRACT_BACKEND in ("auto", "llm"):
-            candidates = extract_with_llm(user_message, assistant_response)
-            
-        if candidates is None:
-            candidates = extract_conversation_candidates(
-                user_message=user_message,
-                assistant_response=assistant_response,
-            )
+        observed_at = utc_now()
+        candidates = extract_conversation_candidates(
+            user_message=user_message,
+            assistant_response=assistant_response,
+        )
         
         result = ObservationResult()
         for candidate in candidates:
+            candidate_tags = list(candidate.get("tags", []))
+            speaker_tag = next((tag for tag in candidate_tags if str(tag).startswith("speaker:")), "")
+            speaker = speaker_tag.split(":", 1)[1] if ":" in speaker_tag else "user"
+            turn_index = 0 if speaker == "user" else 1
+            evidence = build_observation_evidence(
+                transcript=transcript,
+                source_text=str(candidate["content"]),
+                speaker=speaker,
+                turn_index=turn_index,
+                observed_at=observed_at,
+                session_id=session_id,
+            )
             store_result = self.add_node(
                 label=str(candidate["label"]),
                 content=str(candidate["content"]),
                 node_type=candidate["node_type"],
-                tags=list(candidate.get("tags", [])),
+                tags=candidate_tags,
                 source_prompt=transcript,
+                agent_id=agent_id,
+                project=project,
+                session_id=session_id,
+                evidence_records=[evidence],
+                valid_from=observed_at,
             )
             result.stored_nodes.append(store_result.node)
             if store_result.created:
@@ -1054,10 +1436,11 @@ class MemoryGraph:
             added_nodes = [
                 self._row_to_node(row)
                 for row in connection.execute(
-                    """
-                    SELECT id, label, content, node_type, tags, source_prompt, created_at, updated_at, access_count
-                    FROM nodes
-                    WHERE tenant_id = ? AND created_at >= ?
+                """
+                SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records, valid_from, valid_to,
+                       created_at, updated_at, access_count, tenant_id
+                FROM nodes
+                WHERE tenant_id = ? AND created_at >= ?
                     ORDER BY created_at DESC
                     """,
                     (self.tenant_id, cutoff.isoformat()),
@@ -1066,8 +1449,9 @@ class MemoryGraph:
             updated_nodes = [
                 self._row_to_node(row)
                 for row in connection.execute(
-                    """
-                    SELECT id, label, content, node_type, tags, source_prompt, created_at, updated_at, access_count
+                """
+                    SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records, valid_from, valid_to,
+                           created_at, updated_at, access_count, tenant_id
                     FROM nodes
                     WHERE tenant_id = ?
                       AND updated_at >= ?
@@ -1100,7 +1484,14 @@ class MemoryGraph:
             contradiction_edges=contradiction_edges,
         )
 
-    def prime_context(self, *, project: str = "", max_nodes: int = 25) -> PrimeContextResult:
+    def prime_context(
+        self,
+        *,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+        max_nodes: int = 25,
+    ) -> PrimeContextResult:
         with self._lock, self._connect() as connection:
             total_nodes = int(
                 connection.execute("SELECT COUNT(*) FROM nodes WHERE tenant_id = ?", (self.tenant_id,)).fetchone()[0]
@@ -1122,8 +1513,8 @@ class MemoryGraph:
             # Load all embeddable nodes and build graph
             node_rows = connection.execute(
                 """
-                SELECT id, label, content, node_type, tags, source_prompt,
-                       created_at, updated_at, access_count, embedding
+                SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records, valid_from, valid_to,
+                       created_at, updated_at, access_count, embedding, tenant_id
                 FROM nodes
                 WHERE tenant_id = ? AND embedding IS NOT NULL
                 """,
@@ -1136,9 +1527,14 @@ class MemoryGraph:
             nodes_by_id: dict[str, Node] = {}
             for row in node_rows:
                 node = self._row_to_node(row)
+                if not _scope_matches(node, agent_id=agent_id, project=project, session_id=session_id):
+                    continue
                 nodes_by_id[node.id] = node
 
             graph = self._load_graph(connection, node_ids=nodes_by_id.keys())
+
+            if not nodes_by_id:
+                return PrimeContextResult(project=project, summary="No scoped nodes found for priming.")
 
             # Expand from seeds using relation-aware traversal
             max_depth = 2
@@ -1211,7 +1607,8 @@ class MemoryGraph:
         with self._lock, self._connect() as connection:
             node_rows = connection.execute(
                 """
-                SELECT id, label, content, node_type, tags, source_prompt, created_at, updated_at, access_count
+                SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt,
+                       evidence_records, valid_from, valid_to, created_at, updated_at, access_count, tenant_id
                 FROM nodes
                 WHERE tenant_id = ?
                 """
@@ -1310,8 +1707,8 @@ class MemoryGraph:
     ) -> tuple[Node, str, float | None] | None:
         rows = connection.execute(
             """
-            SELECT id, label, content, node_type, tags, source_prompt,
-                   created_at, updated_at, access_count, embedding
+            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records,
+                   valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
             WHERE tenant_id = ? AND embedding IS NOT NULL
             """,
@@ -1327,6 +1724,13 @@ class MemoryGraph:
 
         for row in rows:
             existing_node = self._row_to_node(row)
+            if not _scope_matches(
+                existing_node,
+                agent_id=node.agent_id,
+                project=node.project,
+                session_id=node.session_id,
+            ):
+                continue
             if not compatible_node_types(node.node_type, existing_node.node_type):
                 continue
             existing_label = normalize_text(existing_node.label)
@@ -1419,16 +1823,29 @@ class MemoryGraph:
     ) -> Node:
         merged_tags = list(dict.fromkeys([*existing_node.tags, *incoming_node.tags]))
         updated_source_prompt = existing_node.source_prompt or incoming_node.source_prompt
+        merged_evidence = merge_evidence_records(existing_node.evidence_records, incoming_node.evidence_records)
+        merged_valid_from, merged_valid_to = merge_validity_windows(
+            existing_node.valid_from,
+            incoming_node.valid_from,
+            existing_node.valid_to,
+            incoming_node.valid_to,
+        )
         updated_at = utc_now()
         connection.execute(
             """
             UPDATE nodes
-            SET tags = ?, source_prompt = ?, updated_at = ?
+            SET agent_id = ?, project = ?, session_id = ?, tags = ?, source_prompt = ?, evidence_records = ?, valid_from = ?, valid_to = ?, updated_at = ?
             WHERE id = ? AND tenant_id = ?
             """,
             (
+                _merge_scope_value(existing_node.agent_id, incoming_node.agent_id),
+                _merge_scope_value(existing_node.project, incoming_node.project),
+                _merge_scope_value(existing_node.session_id, incoming_node.session_id),
                 json.dumps(merged_tags),
                 updated_source_prompt,
+                _encode_evidence_records(merged_evidence),
+                merged_valid_from.isoformat() if merged_valid_from is not None else None,
+                merged_valid_to.isoformat() if merged_valid_to is not None else None,
                 updated_at.isoformat(),
                 existing_node.id,
                 self.tenant_id,
@@ -1437,11 +1854,17 @@ class MemoryGraph:
         return Node(
             id=existing_node.id,
             tenant_id=existing_node.tenant_id,
+            agent_id=_merge_scope_value(existing_node.agent_id, incoming_node.agent_id),
+            project=_merge_scope_value(existing_node.project, incoming_node.project),
+            session_id=_merge_scope_value(existing_node.session_id, incoming_node.session_id),
             label=existing_node.label,
             content=existing_node.content,
             node_type=existing_node.node_type,
             tags=merged_tags,
             source_prompt=updated_source_prompt,
+            evidence_records=merged_evidence,
+            valid_from=merged_valid_from,
+            valid_to=merged_valid_to,
             created_at=existing_node.created_at,
             updated_at=updated_at,
             access_count=existing_node.access_count,
@@ -1457,8 +1880,8 @@ class MemoryGraph:
 
         rows = connection.execute(
             """
-            SELECT id, label, content, node_type, tags, source_prompt,
-                   created_at, updated_at, access_count, embedding
+            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt,
+                   evidence_records, valid_from, valid_to, created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
             WHERE tenant_id = ? AND id != ?
             """,
@@ -1467,6 +1890,13 @@ class MemoryGraph:
         conflicts: list[ConflictRecord] = []
         for row in rows:
             existing_node = self._row_to_node(row)
+            if not _scope_matches(
+                existing_node,
+                agent_id=node.agent_id,
+                project=node.project,
+                session_id=node.session_id,
+            ):
+                continue
             reason = detect_conflict_reason(existing_node, node)
             if reason is None:
                 continue
@@ -1514,7 +1944,7 @@ class MemoryGraph:
     def _fetch_node_row(self, connection: sqlite3.Connection, node_id: str) -> sqlite3.Row | None:
         return connection.execute(
             """
-            SELECT id, label, content, node_type, tags, source_prompt,
+            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records, valid_from, valid_to,
                    created_at, updated_at, access_count, embedding, tenant_id
             FROM nodes
             WHERE id = ? AND tenant_id = ?
@@ -1532,7 +1962,8 @@ class MemoryGraph:
         placeholders = ", ".join("?" for _ in node_ids)
         rows = connection.execute(
             f"""
-            SELECT id, label, content, node_type, tags, source_prompt, created_at, updated_at, access_count, tenant_id
+            SELECT id, agent_id, project, session_id, label, content, node_type, tags, source_prompt, evidence_records, valid_from, valid_to,
+                   created_at, updated_at, access_count, tenant_id
             FROM nodes
             WHERE tenant_id = ? AND id IN ({placeholders})
             """,
@@ -1541,15 +1972,122 @@ class MemoryGraph:
         rows_by_id = {row["id"]: row for row in rows}
         return [self._row_to_node(rows_by_id[node_id]) for node_id in node_ids if node_id in rows_by_id]
 
+    def _build_timeline_items(
+        self,
+        *,
+        nodes: list[Node],
+        edges: list[Edge],
+        include_evidence: bool,
+        limit: int,
+    ) -> list[ContextTimelineItem]:
+        items: list[ContextTimelineItem] = []
+        for node in nodes:
+            items.append(
+                ContextTimelineItem(
+                    kind="node_created",
+                    timestamp=node.created_at,
+                    label=node.label,
+                    summary=node.content,
+                    node_id=node.id,
+                )
+            )
+            if node.updated_at != node.created_at:
+                items.append(
+                    ContextTimelineItem(
+                        kind="node_updated",
+                        timestamp=node.updated_at,
+                        label=node.label,
+                        summary=node.content,
+                        node_id=node.id,
+                    )
+                )
+            if include_evidence:
+                for record in node.evidence_records:
+                    items.append(
+                        ContextTimelineItem(
+                            kind="evidence",
+                            timestamp=record.observed_at,
+                            label=node.label,
+                            summary=f"{record.source_role or 'unknown'} turn {record.turn_index}: {record.source_text or node.content}",
+                            node_id=node.id,
+                        )
+                    )
+        node_by_id = {node.id: node for node in nodes}
+        for edge in edges:
+            source_label = node_by_id.get(edge.source_id).label if edge.source_id in node_by_id else edge.source_id[:8]
+            target_label = node_by_id.get(edge.target_id).label if edge.target_id in node_by_id else edge.target_id[:8]
+            items.append(
+                ContextTimelineItem(
+                    kind=f"edge_{edge.relationship.value}",
+                    timestamp=edge.created_at,
+                    label=f"{source_label} -> {target_label}",
+                    summary=edge.relationship.value,
+                    edge_id=edge.id,
+                )
+            )
+        return sorted(
+            items,
+            key=lambda item: (item.timestamp, item.kind, item.label),
+            reverse=True,
+        )[:limit]
+
+    def _build_conflict_entries(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        edges: list[Edge],
+        include_resolved: bool,
+        limit: int,
+    ) -> list[ConflictEntry]:
+        node_ids = list(dict.fromkeys([edge.source_id for edge in edges] + [edge.target_id for edge in edges]))
+        nodes_by_id = {node.id: node for node in self._fetch_nodes_by_ids(connection, node_ids)}
+        entries: list[ConflictEntry] = []
+        for edge in edges:
+            resolved, resolution_note, resolved_at = self._conflict_resolution_state(edge)
+            if resolved and not include_resolved:
+                continue
+            source_node = nodes_by_id.get(edge.source_id)
+            target_node = nodes_by_id.get(edge.target_id)
+            if source_node is None or target_node is None:
+                continue
+            entries.append(
+                ConflictEntry(
+                    edge=edge,
+                    source_node=source_node,
+                    target_node=target_node,
+                    resolved=resolved,
+                    resolution_note=resolution_note,
+                    resolved_at=resolved_at,
+                )
+            )
+            if len(entries) >= limit:
+                break
+        return entries
+
+    def _conflict_resolution_state(self, edge: Edge) -> tuple[bool, str, datetime | None]:
+        metadata = edge.metadata or {}
+        resolved = bool(metadata.get("resolved"))
+        resolution_note = str(metadata.get("resolution_note", "") or "")
+        resolved_at_raw = metadata.get("resolved_at")
+        resolved_at = _parse_datetime(resolved_at_raw) if resolved_at_raw else None
+        return resolved, resolution_note, resolved_at
+
     def _row_to_node(self, row: sqlite3.Row) -> Node:
+        row_keys = set(row.keys())
         return Node(
             id=row["id"],
             tenant_id=row["tenant_id"] if "tenant_id" in row.keys() else self.tenant_id,
+            agent_id=row["agent_id"] if "agent_id" in row_keys else "",
+            project=row["project"] if "project" in row_keys else "",
+            session_id=row["session_id"] if "session_id" in row_keys else "",
             label=row["label"],
             content=row["content"],
             node_type=NodeType(row["node_type"]),
             tags=json.loads(row["tags"] or "[]"),
             source_prompt=row["source_prompt"] or "",
+            evidence_records=_decode_evidence_records(row["evidence_records"]) if "evidence_records" in row_keys else [],
+            valid_from=_parse_datetime(row["valid_from"]) if "valid_from" in row_keys and row["valid_from"] else None,
+            valid_to=_parse_datetime(row["valid_to"]) if "valid_to" in row_keys and row["valid_to"] else None,
             created_at=_parse_datetime(row["created_at"]),
             updated_at=_parse_datetime(row["updated_at"]),
             access_count=int(row["access_count"] or 0),
@@ -1888,7 +2426,7 @@ class MemoryGraph:
         project_lower = project.strip().lower()
         rows = connection.execute(
             """
-            SELECT id, label, content, tags, updated_at
+            SELECT id, label, content, tags, project, updated_at
             FROM nodes
             WHERE tenant_id = ?
             ORDER BY updated_at DESC
@@ -1897,9 +2435,10 @@ class MemoryGraph:
         scored: list[tuple[str, float, str]] = []
         for row in rows:
             tags = json.loads(row["tags"] or "[]")
-            tag_match = 1.0 if any(project_lower == str(tag).lower() for tag in tags) else 0.0
+            tag_match = 1.0 if any(project_lower in {str(tag).lower(), f"project:{str(tag).lower()}"} for tag in tags) else 0.0
+            explicit_match = 1.0 if str(row["project"] or "").strip().lower() == project_lower else 0.0
             lexical = lexical_overlap(project, row["label"], row["content"])
-            score = max(tag_match, lexical)
+            score = max(explicit_match, tag_match, lexical)
             if score <= 0.0:
                 continue
             scored.append((row["id"], score, row["updated_at"]))
@@ -1919,7 +2458,8 @@ class MemoryGraph:
     def _build_backup_snapshot(self, connection: sqlite3.Connection) -> dict[str, Any]:
         node_rows = connection.execute(
             """
-            SELECT id, tenant_id, label, content, node_type, tags, source_prompt, created_at, updated_at, access_count
+            SELECT id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, source_prompt,
+                   evidence_records, valid_from, valid_to, created_at, updated_at, access_count
             FROM nodes
             WHERE tenant_id = ?
             ORDER BY created_at ASC
@@ -1940,11 +2480,17 @@ class MemoryGraph:
                 {
                     "id": row["id"],
                     "tenant_id": row["tenant_id"],
+                    "agent_id": row["agent_id"] or "",
+                    "project": row["project"] or "",
+                    "session_id": row["session_id"] or "",
                     "label": row["label"],
                     "content": row["content"],
                     "node_type": row["node_type"],
                     "tags": json.loads(row["tags"] or "[]"),
                     "source_prompt": row["source_prompt"] or "",
+                    "evidence_records": [record.model_dump(mode="json") for record in _decode_evidence_records(row["evidence_records"])],
+                    "valid_from": row["valid_from"],
+                    "valid_to": row["valid_to"],
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                     "access_count": int(row["access_count"] or 0),
@@ -1971,20 +2517,26 @@ class MemoryGraph:
         connection.execute(
             """
             INSERT INTO nodes (
-                id, tenant_id, label, content, node_type, tags, embedding,
-                source_prompt, created_at, updated_at, access_count
+                id, tenant_id, agent_id, project, session_id, label, content, node_type, tags, embedding,
+                source_prompt, evidence_records, valid_from, valid_to, created_at, updated_at, access_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raw_node["id"],
                 raw_node.get("tenant_id", self.tenant_id),
+                raw_node.get("agent_id", ""),
+                raw_node.get("project", ""),
+                raw_node.get("session_id", ""),
                 raw_node["label"],
                 raw_node["content"],
                 raw_node["node_type"],
                 json.dumps(raw_node.get("tags", [])),
                 embedding,
                 raw_node.get("source_prompt", ""),
+                _encode_evidence_records([EvidenceRecord.model_validate(item) for item in raw_node.get("evidence_records", [])]),
+                raw_node.get("valid_from"),
+                raw_node.get("valid_to"),
                 raw_node["created_at"],
                 raw_node["updated_at"],
                 int(raw_node.get("access_count", 0)),
@@ -1996,18 +2548,25 @@ class MemoryGraph:
         connection.execute(
             """
             UPDATE nodes
-            SET tenant_id = ?, label = ?, content = ?, node_type = ?, tags = ?, embedding = ?,
-                source_prompt = ?, created_at = ?, updated_at = ?, access_count = ?
+            SET tenant_id = ?, agent_id = ?, project = ?, session_id = ?, label = ?, content = ?, node_type = ?, tags = ?, embedding = ?,
+                source_prompt = ?, evidence_records = ?, valid_from = ?, valid_to = ?,
+                created_at = ?, updated_at = ?, access_count = ?
             WHERE id = ? AND tenant_id = ?
             """,
             (
                 raw_node.get("tenant_id", self.tenant_id),
+                raw_node.get("agent_id", ""),
+                raw_node.get("project", ""),
+                raw_node.get("session_id", ""),
                 raw_node["label"],
                 raw_node["content"],
                 raw_node["node_type"],
                 json.dumps(raw_node.get("tags", [])),
                 embedding,
                 raw_node.get("source_prompt", ""),
+                _encode_evidence_records([EvidenceRecord.model_validate(item) for item in raw_node.get("evidence_records", [])]),
+                raw_node.get("valid_from"),
+                raw_node.get("valid_to"),
                 raw_node["created_at"],
                 raw_node["updated_at"],
                 int(raw_node.get("access_count", 0)),

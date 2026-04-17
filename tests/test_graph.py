@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import networkx as nx
@@ -249,6 +250,109 @@ def test_export_graph_html_creates_visualization_file(tmp_path: Path) -> None:
     assert "part_of" in html
 
 
+def test_export_context_bundle_query_writes_markdown_and_json(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    decision = graph.add_node(
+        label="Use PostgreSQL",
+        content="We decided to use PostgreSQL for production.",
+        node_type=NodeType.DECISION,
+    ).node
+    reason = graph.add_node(
+        label="MySQL replication pain",
+        content="MySQL replication was painful to operate.",
+        node_type=NodeType.FACT,
+    ).node
+    graph.add_edge(
+        source_id=decision.id,
+        target_id=reason.id,
+        relationship=RelationType.DEPENDS_ON,
+    )
+
+    exported = graph.export_context_bundle(
+        mode="query",
+        query="what database did we decide on",
+        format="both",
+        output_path=tmp_path / "handoff",
+        include_source_prompt=False,
+    )
+
+    assert exported.markdown_path is not None
+    assert exported.json_path is not None
+    markdown = Path(exported.markdown_path).read_text(encoding="utf-8")
+    payload = json.loads(Path(exported.json_path).read_text(encoding="utf-8"))
+
+    assert "## Decisions With Reasons" in markdown
+    assert "Use PostgreSQL" in markdown
+    assert "MySQL replication pain" in markdown
+    assert payload["export_type"] == "context_bundle"
+    assert payload["mode"] == "query"
+    assert payload["query"] == "what database did we decide on"
+    assert payload["nodes"]
+    assert payload["edges"]
+    assert payload["render_hints"]["token_estimate"] > 0
+
+
+def test_export_context_bundle_prime_uses_prime_context_summary(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="Alpha Project",
+        content="Alpha uses FastAPI and SQLite for local development.",
+        node_type=NodeType.ENTITY,
+        tags=["alpha"],
+    )
+    graph.add_node(
+        label="Alpha Decision",
+        content="We decided to keep Alpha on SQLite locally.",
+        node_type=NodeType.DECISION,
+        tags=["alpha"],
+    )
+
+    exported = graph.export_context_bundle(
+        mode="prime",
+        project="alpha",
+        format="markdown",
+        output_path=tmp_path / "prime-context.md",
+    )
+
+    assert exported.markdown_path is not None
+    markdown = Path(exported.markdown_path).read_text(encoding="utf-8")
+    assert "## Memory Summary" in markdown
+    assert "Prime context" in markdown
+    assert "Alpha Decision" in markdown
+
+
+def test_export_context_bundle_graph_chunks_large_appendix(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    previous = None
+    for index in range(45):
+        node = graph.add_node(
+            label=f"Fact {index}",
+            content=f"Portable export item {index}",
+            node_type=NodeType.FACT,
+        ).node
+        if previous is not None:
+            graph.add_edge(
+                source_id=previous.id,
+                target_id=node.id,
+                relationship=RelationType.RELATES_TO,
+            )
+        previous = node
+
+    exported = graph.export_context_bundle(
+        mode="graph",
+        format="both",
+        output_path=tmp_path / "full-graph",
+    )
+
+    markdown = Path(exported.markdown_path).read_text(encoding="utf-8")
+    payload = json.loads(Path(exported.json_path).read_text(encoding="utf-8"))
+
+    assert "Appendix Chunk 1/" in markdown
+    assert exported.bundle.render_hints.chunk_count >= 2
+    assert "large_graph" in payload["render_hints"]["truncation_flags"]
+    assert payload["stats"]["total_nodes"] == 45
+
+
 def test_conflict_detection_creates_contradiction_edge(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
     first = graph.add_node(
@@ -343,6 +447,149 @@ def test_observe_conversation_extracts_nodes(tmp_path: Path) -> None:
     assert "I prefer Python for backend work" in labels
     assert "Can we use FastAPI?" in labels
     assert "src/server.py" in labels
+    assert all(node.evidence_records for node in result.stored_nodes)
+    assert all(node.valid_from is not None for node in result.stored_nodes)
+
+
+def test_duplicate_nodes_accumulate_evidence_records(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    first = graph.observe_conversation(
+        user_message="We chose PostgreSQL for production.",
+        assistant_response="Understood.",
+    )
+    second = graph.observe_conversation(
+        user_message="Reminder: we chose PostgreSQL for production.",
+        assistant_response="Got it.",
+    )
+
+    node = next(item for item in second.stored_nodes if item.label == "Database decision")
+
+    assert second.reused_count >= 1
+    assert len(node.evidence_records) >= 2
+
+
+def test_get_node_history_returns_evidence_and_related_nodes(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    decision = graph.add_node(
+        label="Use PostgreSQL",
+        content="We chose PostgreSQL.",
+        node_type=NodeType.DECISION,
+    ).node
+    fact = graph.add_node(
+        label="Need ACID",
+        content="ACID compliance matters.",
+        node_type=NodeType.FACT,
+    ).node
+    graph.add_edge(
+        source_id=decision.id,
+        target_id=fact.id,
+        relationship=RelationType.DEPENDS_ON,
+    )
+
+    observed = graph.observe_conversation(
+        user_message="We chose PostgreSQL.",
+        assistant_response="I will remember that decision.",
+    )
+    assert observed.stored_nodes
+    history = graph.get_node_history(node_id=decision.id, max_depth=1)
+
+    assert history.node.evidence_records
+    assert any(node.id != history.node.id for node in history.related_nodes)
+    assert any(edge.relationship == RelationType.DEPENDS_ON for edge in history.edges)
+
+
+def test_timeline_includes_evidence_and_edges(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    decision = graph.add_node(
+        label="Use PostgreSQL",
+        content="We chose PostgreSQL.",
+        node_type=NodeType.DECISION,
+    ).node
+    fact = graph.add_node(
+        label="Need ACID",
+        content="ACID compliance matters.",
+        node_type=NodeType.FACT,
+    ).node
+    graph.add_edge(
+        source_id=decision.id,
+        target_id=fact.id,
+        relationship=RelationType.DEPENDS_ON,
+    )
+    graph.observe_conversation(
+        user_message="We chose PostgreSQL.",
+        assistant_response="I will remember that decision.",
+    )
+
+    timeline = graph.timeline(node_id=decision.id, max_depth=1, include_evidence=True, limit=10)
+    kinds = {item.kind for item in timeline.items}
+
+    assert timeline.scope == f"node:{decision.id}"
+    assert "node_created" in kinds
+    assert "evidence" in kinds
+    assert "edge_depends_on" in kinds
+
+
+def test_list_conflicts_and_resolve_conflict(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="REST Preference",
+        content="User prefers REST APIs for backend services",
+        node_type=NodeType.PREFERENCE,
+    )
+    graph.add_node(
+        label="GraphQL Preference",
+        content="User prefers GraphQL APIs for backend services",
+        node_type=NodeType.PREFERENCE,
+    )
+
+    conflicts = graph.list_conflicts()
+
+    assert len(conflicts.conflicts) == 1
+    assert conflicts.conflicts[0].resolved is False
+
+    resolved = graph.resolve_conflict(
+        edge_id=conflicts.conflicts[0].edge.id,
+        resolution_note="Superseded by the newer API decision.",
+    )
+
+    assert resolved.resolved is True
+    assert resolved.resolution_note == "Superseded by the newer API decision."
+    assert graph.list_conflicts().conflicts == []
+
+    resolved_conflicts = graph.list_conflicts(include_resolved=True)
+    assert len(resolved_conflicts.conflicts) == 1
+    assert resolved_conflicts.conflicts[0].resolved is True
+
+
+def test_query_can_filter_by_explicit_scopes(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="DB choice alpha",
+        content="We chose PostgreSQL for production.",
+        node_type=NodeType.DECISION,
+        project="alpha",
+        agent_id="codex",
+        session_id="sess-alpha",
+    )
+    graph.add_node(
+        label="DB choice beta",
+        content="We chose MySQL for production.",
+        node_type=NodeType.DECISION,
+        project="beta",
+        agent_id="claude",
+        session_id="sess-beta",
+    )
+
+    alpha = graph.query(query="production database", project="alpha", agent_id="codex")
+    beta = graph.query(query="production database", session_id="sess-beta")
+    scopes = graph.list_context_scopes()
+
+    assert [node.label for node in alpha.nodes] == ["DB choice alpha"]
+    assert [node.label for node in beta.nodes] == ["DB choice beta"]
+    assert scopes.agent_ids == ["claude", "codex"]
+    assert scopes.projects == ["alpha", "beta"]
+    assert scopes.session_ids == ["sess-alpha", "sess-beta"]
 
 
 def test_observe_conversation_extracts_clean_database_and_auth_facts(tmp_path: Path) -> None:

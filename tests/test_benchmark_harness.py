@@ -44,6 +44,9 @@ def test_fixture_loading_is_auditable() -> None:
     assert len(fixtures["dedup_cases"]) == 22
     assert len(fixtures["comparative_eval"]["scenarios"]) >= 20
     assert len(fixtures["comparative_eval"]["queries"]) == 66
+    assert len(fixtures["query_stress_cases"]["queries"]) >= 40
+    assert sum(1 for case in fixtures["query_stress_cases"]["queries"] if case["task_family"] == "adversarial_paraphrase") >= 20
+    assert sum(1 for case in fixtures["query_stress_cases"]["queries"] if case["task_family"] == "temporal_latest") >= 20
     assert any(not case["should_dedup"] for case in fixtures["dedup_cases"])
     assert any(case["should_dedup"] for case in fixtures["dedup_cases"])
 
@@ -69,6 +72,8 @@ def test_benchmark_report_includes_backend_labels_and_case_counts() -> None:
     assert "threshold" in dedup.metadata
     assert report.comparative["corpus"]["scenario_count"] >= 20
     assert report.comparative["corpus"]["query_count"] == 66
+    assert report.fixtures["query_stress_cases"] >= 40
+    assert set(report.stress_eval["systems"]) == {"graph_raw", "graph_hybrid"}
     assert set(report.comparative["systems"]) == {"waggle", "rag_naive", "rag_tuned"}
     assert len(report.comparative["per_case"]) == 198
 
@@ -86,19 +91,14 @@ def test_markdown_summary_includes_comparative_systems() -> None:
     assert "| waggle |" in markdown
     assert "| rag_naive |" in markdown
     assert "Failure Protocol" in markdown
+    assert "## Query Stress Eval" in markdown
+def test_benchmark_report_runs_regex_only_extraction() -> None:
+    report = run_benchmarks(extraction_backend="regex", embedding_model=FakeEmbeddingModel())
 
-
-def test_llm_benchmark_failure_is_explicit(monkeypatch) -> None:
-    monkeypatch.setattr("waggle.benchmark_harness.extract_with_llm", lambda *args, **kwargs: None)
-
-    report = run_benchmarks(extraction_backend="llm", embedding_model=FakeEmbeddingModel())
-
-    assert report.errors
-    assert "LLM extraction backend unavailable" in report.errors[0]
-    assert all(
-        not (metric.metric == "extraction" and metric.backend == "llm")
-        for metric in report.metrics
-    )
+    extraction_metrics = [metric for metric in report.metrics if metric.metric == "extraction"]
+    assert len(extraction_metrics) == 1
+    assert extraction_metrics[0].backend == "regex"
+    assert extraction_metrics[0].metadata["runtime"] == "deterministic-regex"
 
 
 def test_dedup_threshold_sweep_tracks_positive_and_negative_cases() -> None:

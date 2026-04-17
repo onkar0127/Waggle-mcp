@@ -12,8 +12,9 @@ import networkx as nx
 import numpy as np
 
 from waggle.auth import generate_api_key, hash_api_key, verify_api_key
+from waggle.context_bundle import build_context_bundle, export_context_bundle_files
+from waggle.evidence import build_observation_evidence, merge_evidence_records, merge_validity_windows
 from waggle.errors import AuthenticationError, ValidationFailure
-from waggle.extractor import EXTRACT_BACKEND, extract_with_llm
 from waggle.intelligence import (
     compatible_node_types,
     detect_conflict_reason,
@@ -38,13 +39,20 @@ from waggle.models import (
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
+    ConflictEntry,
+    ConflictListResult,
     ConflictRecord,
     ConnectedNodeStat,
+    ContextBundleExportResult,
+    ContextScopeResult,
+    ContextTimelineItem,
     Edge,
+    EvidenceRecord,
     GraphDiffResult,
     GraphStats,
     ImportResult,
     Node,
+    NodeHistoryResult,
     NodeStoreResult,
     NodeType,
     ObservationResult,
@@ -53,6 +61,7 @@ from waggle.models import (
     RelationType,
     SubgraphResult,
     TenantRecord,
+    TimelineResult,
     TopicCluster,
     TopicResult,
     utc_now,
@@ -84,6 +93,21 @@ def _decode_metadata(raw: Any) -> dict[str, Any]:
             return {}
         return decoded if isinstance(decoded, dict) else {}
     return {}
+
+
+def _scope_matches(node: Node, *, agent_id: str = "", project: str = "", session_id: str = "") -> bool:
+    normalized_agent = agent_id.strip().lower()
+    normalized_project = project.strip().lower()
+    normalized_session = session_id.strip().lower()
+    if normalized_agent and node.agent_id.strip().lower() != normalized_agent:
+        return False
+    if normalized_session and node.session_id.strip().lower() != normalized_session:
+        return False
+    if normalized_project:
+        project_tags = {str(tag).strip().lower() for tag in node.tags}
+        if node.project.strip().lower() != normalized_project and normalized_project not in project_tags and f"project:{normalized_project}" not in project_tags:
+            return False
+    return True
 
 
 class Neo4jMemoryGraph:
@@ -338,14 +362,26 @@ class Neo4jMemoryGraph:
         node_type: NodeType,
         tags: list[str] | None = None,
         source_prompt: str = "",
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+        evidence_records: list[EvidenceRecord] | None = None,
+        valid_from: datetime | None = None,
+        valid_to: datetime | None = None,
     ) -> NodeStoreResult:
         node = Node(
             tenant_id=self.tenant_id,
+            agent_id=agent_id,
+            project=project,
+            session_id=session_id,
             label=label,
             content=content,
             node_type=node_type,
             tags=tags or [],
             source_prompt=source_prompt,
+            evidence_records=evidence_records or [],
+            valid_from=valid_from,
+            valid_to=valid_to,
         )
         embedding = self.embedding_model.embed(node.content)
 
@@ -381,12 +417,18 @@ class Neo4jMemoryGraph:
                 CREATE (n:MemoryNode {
                     id: $id,
                     tenant_id: $tenant_id,
+                    agent_id: $agent_id,
+                    project: $project,
+                    session_id: $session_id,
                     label: $label,
                     content: $content,
                     node_type: $node_type,
                     tags: $tags,
                     embedding: $embedding,
                     source_prompt: $source_prompt,
+                    evidence_records: $evidence_records,
+                    valid_from: $valid_from,
+                    valid_to: $valid_to,
                     created_at: $created_at,
                     updated_at: $updated_at,
                     access_count: $access_count
@@ -456,7 +498,16 @@ class Neo4jMemoryGraph:
                 raise ValueError(f"Node not found: {node_id}")
             return node
 
-    def query(self, *, query: str, max_nodes: int = 20, max_depth: int = 2) -> SubgraphResult:
+    def query(
+        self,
+        *,
+        query: str,
+        max_nodes: int = 20,
+        max_depth: int = 2,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+    ) -> SubgraphResult:
         query_text = query.strip()
         if not query_text:
             raise ValueError("Query cannot be empty.")
@@ -478,11 +529,18 @@ class Neo4jMemoryGraph:
             if total_nodes == 0:
                 return SubgraphResult(query=query_text, total_nodes_in_graph=0)
 
-            nodes_by_id = {props["id"]: self._node_from_props(props) for props in node_records}
+            nodes_by_id = {
+                props["id"]: node
+                for props in node_records
+                for node in [self._node_from_props(props)]
+                if _scope_matches(node, agent_id=agent_id, project=project, session_id=session_id)
+            }
+            if not nodes_by_id:
+                return SubgraphResult(query=query_text, total_nodes_in_graph=total_nodes)
             embeddings_by_id = {
                 props["id"]: np.array(props.get("embedding") or [], dtype=np.float32)
                 for props in node_records
-                if props.get("embedding")
+                if props.get("embedding") and props["id"] in nodes_by_id
             }
 
             query_embedding = self.embedding_model.embed(query_text)
@@ -680,6 +738,21 @@ class Neo4jMemoryGraph:
                 )
             ]
 
+    def list_context_scopes(self) -> ContextScopeResult:
+        with self._lock, self._session() as session:
+            nodes = [
+                self._node_from_props(record["n"])
+                for record in session.run(
+                    "MATCH (n:MemoryNode {tenant_id: $tenant_id}) RETURN n",
+                    tenant_id=self.tenant_id,
+                )
+            ]
+        return ContextScopeResult(
+            agent_ids=sorted({node.agent_id for node in nodes if node.agent_id}),
+            projects=sorted({node.project for node in nodes if node.project}),
+            session_ids=sorted({node.session_id for node in nodes if node.session_id}),
+        )
+
     def get_stats(self) -> GraphStats:
         with self._lock, self._session() as session:
             total_nodes = session.run(
@@ -874,6 +947,117 @@ class Neo4jMemoryGraph:
             edge_count=len(snapshot["edges"]),
         )
 
+    def export_context_bundle(
+        self,
+        *,
+        mode: str = "prime",
+        query: str = "",
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+        max_nodes: int = 25,
+        max_depth: int = 2,
+        format: str = "both",
+        output_path: str | Path | None = None,
+        include_edges: bool = True,
+        include_timestamps: bool = True,
+        include_source_prompt: bool = False,
+        audience: str = "llm",
+    ) -> ContextBundleExportResult:
+        normalized_mode = mode.strip().lower()
+        normalized_format = format.strip().lower()
+        normalized_audience = audience.strip().lower()
+        if normalized_mode not in {"prime", "query", "graph"}:
+            raise ValidationFailure("mode must be one of: prime, query, graph.")
+        if normalized_format not in {"markdown", "json", "both"}:
+            raise ValidationFailure("format must be one of: markdown, json, both.")
+        if normalized_audience not in {"llm", "human"}:
+            raise ValidationFailure("audience must be one of: llm, human.")
+        if normalized_mode == "query" and not query.strip():
+            raise ValidationFailure("query is required when mode='query'.")
+
+        if normalized_mode == "prime":
+            selected = self.prime_context(project=project, agent_id=agent_id, session_id=session_id)
+            selected_nodes = selected.nodes[:max_nodes]
+            selected_edges = selected.edges if include_edges else []
+            summary = selected.summary
+        elif normalized_mode == "query":
+            selected = self.query(
+                query=query,
+                max_nodes=max_nodes,
+                max_depth=max_depth,
+                agent_id=agent_id,
+                project=project,
+                session_id=session_id,
+            )
+            selected_nodes = selected.nodes
+            selected_edges = selected.edges if include_edges else []
+            summary = (
+                f"Query context for '{query}' with {len(selected.nodes)} nodes and {len(selected.edges) if include_edges else 0} edges."
+            )
+        else:
+            with self._lock, self._session() as session:
+                selected_nodes = [
+                    node
+                    for record in session.run(
+                        "MATCH (n:MemoryNode {tenant_id: $tenant_id}) RETURN n ORDER BY n.updated_at DESC, n.created_at DESC",
+                        tenant_id=self.tenant_id,
+                    )
+                    for node in [self._node_from_props(record["n"])]
+                    if _scope_matches(node, agent_id=agent_id, project=project, session_id=session_id)
+                ]
+                selected_edges = [
+                    Edge(
+                        id=record["id"],
+                        source_id=record["source_id"],
+                        target_id=record["target_id"],
+                        relationship=RelationType(record["relationship"]),
+                        weight=float(record["weight"]),
+                        metadata=_decode_metadata(record["metadata"]),
+                        created_at=_parse_datetime(record["created_at"]),
+                    )
+                    for record in session.run(
+                        """
+                        MATCH (source:MemoryNode {tenant_id: $tenant_id})-[r:MEMORY_EDGE {tenant_id: $tenant_id}]->(target:MemoryNode {tenant_id: $tenant_id})
+                        RETURN r.id AS id, source.id AS source_id, target.id AS target_id,
+                               r.relationship AS relationship, r.weight AS weight,
+                               r.metadata AS metadata, r.created_at AS created_at
+                        ORDER BY r.created_at ASC
+                        """,
+                        tenant_id=self.tenant_id,
+                    )
+                ] if include_edges else []
+            if include_edges:
+                selected_ids = {node.id for node in selected_nodes}
+                selected_edges = [
+                    edge for edge in selected_edges if edge.source_id in selected_ids and edge.target_id in selected_ids
+                ]
+            summary = (
+                f"Full graph export for tenant '{self.tenant_id}' with {len(selected_nodes)} nodes and "
+                f"{len(selected_edges)} edges."
+            )
+
+        bundle = build_context_bundle(
+            tenant_id=self.tenant_id,
+            project=project,
+            mode=normalized_mode,
+            audience=normalized_audience,
+            query=query,
+            summary=summary,
+            nodes=selected_nodes,
+            edges=selected_edges,
+            stats=self.get_stats(),
+        )
+        return export_context_bundle_files(
+            bundle,
+            output_path=output_path,
+            export_dir=self.export_dir,
+            format=normalized_format,
+            include_edges=include_edges,
+            include_timestamps=include_timestamps,
+            include_source_prompt=include_source_prompt,
+        )
+
     def import_graph_backup(self, *, input_path: str | Path) -> ImportResult:
         source = Path(input_path).expanduser()
         snapshot = json.loads(source.read_text(encoding="utf-8"))
@@ -976,27 +1160,204 @@ class Neo4jMemoryGraph:
             total_nodes_in_graph=int(total_nodes),
         )
 
-    def observe_conversation(self, *, user_message: str, assistant_response: str) -> ObservationResult:
-        transcript = f"user: {user_message.strip()}\nassistant: {assistant_response.strip()}".strip()
-        candidates = None
-        
-        if EXTRACT_BACKEND in ("auto", "llm"):
-            candidates = extract_with_llm(user_message, assistant_response)
-            
-        if candidates is None:
-            candidates = extract_conversation_candidates(
-                user_message=user_message,
-                assistant_response=assistant_response,
+    def get_node_history(self, *, node_id: str, max_depth: int = 2) -> NodeHistoryResult:
+        node = self.get_node(node_id)
+        related = self.get_related(node_id=node_id, max_depth=max_depth)
+        related_nodes = [item for item in related.nodes if item.id != node_id]
+        return NodeHistoryResult(node=node, related_nodes=related_nodes, edges=related.edges)
+
+    def timeline(
+        self,
+        *,
+        node_id: str = "",
+        query: str = "",
+        limit: int = 25,
+        max_depth: int = 2,
+        include_evidence: bool = True,
+    ) -> TimelineResult:
+        if limit < 1:
+            raise ValueError("limit must be at least 1.")
+        if max_depth < 0:
+            raise ValueError("max_depth cannot be negative.")
+        if node_id.strip() and query.strip():
+            raise ValueError("Provide either node_id or query, not both.")
+
+        if node_id.strip():
+            related = self.get_related(node_id=node_id, max_depth=max_depth)
+            nodes = related.nodes
+            edges = related.edges
+            scope = f"node:{node_id.strip()}"
+        elif query.strip():
+            subgraph = self.query(query=query, max_nodes=max(limit, 10), max_depth=max_depth)
+            nodes = subgraph.nodes
+            edges = subgraph.edges
+            scope = f"query:{query.strip()}"
+        else:
+            with self._lock, self._session() as session:
+                nodes = self.list_recent_nodes(limit=max(limit, 10))
+                edges = self._fetch_edges_for_nodes(session, [node.id for node in nodes])
+            scope = "tenant"
+
+        items = self._build_timeline_items(
+            nodes=nodes,
+            edges=edges,
+            include_evidence=include_evidence,
+            limit=limit,
+        )
+        return TimelineResult(scope=scope, items=items)
+
+    def list_conflicts(
+        self,
+        *,
+        include_resolved: bool = False,
+        limit: int = 25,
+    ) -> ConflictListResult:
+        if limit < 1:
+            raise ValueError("limit must be at least 1.")
+
+        with self._lock, self._session() as session:
+            edges = [
+                Edge(
+                    id=record["id"],
+                    tenant_id=self.tenant_id,
+                    source_id=record["source_id"],
+                    target_id=record["target_id"],
+                    relationship=RelationType(record["relationship"]),
+                    weight=float(record["weight"]),
+                    metadata=_decode_metadata(record["metadata"]),
+                    created_at=_parse_datetime(record["created_at"]),
+                )
+                for record in session.run(
+                    """
+                    MATCH (source:MemoryNode {tenant_id: $tenant_id})-[r:MEMORY_EDGE {tenant_id: $tenant_id}]->(target:MemoryNode {tenant_id: $tenant_id})
+                    WHERE r.relationship IN [$contradicts, $updates]
+                    RETURN r.id AS id, source.id AS source_id, target.id AS target_id,
+                           r.relationship AS relationship, r.weight AS weight,
+                           r.metadata AS metadata, r.created_at AS created_at
+                    ORDER BY r.created_at DESC
+                    """,
+                    tenant_id=self.tenant_id,
+                    contradicts=RelationType.CONTRADICTS.value,
+                    updates=RelationType.UPDATES.value,
+                )
+            ]
+            entries = self._build_conflict_entries(
+                session,
+                edges=edges,
+                include_resolved=include_resolved,
+                limit=limit,
             )
+        return ConflictListResult(conflicts=entries, include_resolved=include_resolved)
+
+    def resolve_conflict(
+        self,
+        *,
+        edge_id: str,
+        resolution_note: str = "",
+    ) -> ConflictEntry:
+        with self._lock, self._session() as session:
+            record = session.run(
+                """
+                MATCH (source:MemoryNode {tenant_id: $tenant_id})-[r:MEMORY_EDGE {tenant_id: $tenant_id, id: $edge_id}]->(target:MemoryNode {tenant_id: $tenant_id})
+                RETURN r.id AS id, source.id AS source_id, target.id AS target_id,
+                       r.relationship AS relationship, r.weight AS weight,
+                       r.metadata AS metadata, r.created_at AS created_at
+                LIMIT 1
+                """,
+                tenant_id=self.tenant_id,
+                edge_id=edge_id,
+            ).single()
+            if record is None:
+                raise ValueError(f"Conflict edge not found: {edge_id}")
+            edge = Edge(
+                id=record["id"],
+                tenant_id=self.tenant_id,
+                source_id=record["source_id"],
+                target_id=record["target_id"],
+                relationship=RelationType(record["relationship"]),
+                weight=float(record["weight"]),
+                metadata=_decode_metadata(record["metadata"]),
+                created_at=_parse_datetime(record["created_at"]),
+            )
+            if edge.relationship not in {RelationType.CONTRADICTS, RelationType.UPDATES}:
+                raise ValueError("Only contradicts or updates edges can be resolved.")
+
+            metadata = dict(edge.metadata)
+            metadata["resolved"] = True
+            metadata["resolved_at"] = utc_now().isoformat()
+            if resolution_note.strip():
+                metadata["resolution_note"] = resolution_note.strip()
+
+            session.run(
+                """
+                MATCH ()-[r:MEMORY_EDGE {tenant_id: $tenant_id, id: $edge_id}]->()
+                SET r.metadata = $metadata
+                """,
+                tenant_id=self.tenant_id,
+                edge_id=edge_id,
+                metadata=_encode_metadata(metadata),
+            ).consume()
+            updated_edge = Edge(
+                id=edge.id,
+                tenant_id=edge.tenant_id,
+                source_id=edge.source_id,
+                target_id=edge.target_id,
+                relationship=edge.relationship,
+                weight=edge.weight,
+                metadata=metadata,
+                created_at=edge.created_at,
+            )
+            entries = self._build_conflict_entries(
+                session,
+                edges=[updated_edge],
+                include_resolved=True,
+                limit=1,
+            )
+        if not entries:
+            raise ValueError(f"Resolved conflict could not be loaded: {edge_id}")
+        return entries[0]
+
+    def observe_conversation(
+        self,
+        *,
+        user_message: str,
+        assistant_response: str,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+    ) -> ObservationResult:
+        transcript = f"user: {user_message.strip()}\nassistant: {assistant_response.strip()}".strip()
+        observed_at = utc_now()
+        candidates = extract_conversation_candidates(
+            user_message=user_message,
+            assistant_response=assistant_response,
+        )
         
         result = ObservationResult()
         for candidate in candidates:
+            candidate_tags = list(candidate.get("tags", []))
+            speaker_tag = next((tag for tag in candidate_tags if str(tag).startswith("speaker:")), "")
+            speaker = speaker_tag.split(":", 1)[1] if ":" in speaker_tag else "user"
+            turn_index = 0 if speaker == "user" else 1
+            evidence = build_observation_evidence(
+                transcript=transcript,
+                source_text=str(candidate["content"]),
+                speaker=speaker,
+                turn_index=turn_index,
+                observed_at=observed_at,
+                session_id=session_id,
+            )
             store_result = self.add_node(
                 label=str(candidate["label"]),
                 content=str(candidate["content"]),
                 node_type=candidate["node_type"],
-                tags=list(candidate.get("tags", [])),
+                tags=candidate_tags,
                 source_prompt=transcript,
+                agent_id=agent_id,
+                project=project,
+                session_id=session_id,
+                evidence_records=[evidence],
+                valid_from=observed_at,
             )
             result.stored_nodes.append(store_result.node)
             if store_result.created:
@@ -1069,7 +1430,7 @@ class Neo4jMemoryGraph:
             contradiction_edges=[edge for edge in created_edges if edge.relationship == RelationType.CONTRADICTS],
         )
 
-    def prime_context(self, *, project: str = "") -> PrimeContextResult:
+    def prime_context(self, *, project: str = "", agent_id: str = "", session_id: str = "") -> PrimeContextResult:
         with self._lock, self._session() as session:
             total_nodes = int(
                 session.run(
@@ -1086,7 +1447,11 @@ class Neo4jMemoryGraph:
             if project.strip():
                 selected_ids.extend(self._find_project_node_ids(session, project=project, limit=8))
             unique_ids = list(dict.fromkeys(selected_ids))
-            nodes = self._fetch_nodes_by_ids(session, unique_ids)
+            nodes = [
+                node
+                for node in self._fetch_nodes_by_ids(session, unique_ids)
+                if _scope_matches(node, agent_id=agent_id, project=project, session_id=session_id)
+            ]
             edges = self._fetch_edges_for_nodes(session, [node.id for node in nodes])
 
         summary = (
@@ -1167,12 +1532,18 @@ class Neo4jMemoryGraph:
         return {
             "id": node.id,
             "tenant_id": node.tenant_id,
+            "agent_id": node.agent_id,
+            "project": node.project,
+            "session_id": node.session_id,
             "label": node.label,
             "content": node.content,
             "node_type": node.node_type.value,
             "tags": node.tags,
             "embedding": embedding.astype(np.float32).tolist(),
             "source_prompt": node.source_prompt,
+            "evidence_records": [record.model_dump(mode="json") for record in node.evidence_records],
+            "valid_from": node.valid_from.isoformat() if node.valid_from is not None else None,
+            "valid_to": node.valid_to.isoformat() if node.valid_to is not None else None,
             "created_at": node.created_at.isoformat(),
             "updated_at": node.updated_at.isoformat(),
             "access_count": node.access_count,
@@ -1182,11 +1553,17 @@ class Neo4jMemoryGraph:
         return Node(
             id=props["id"],
             tenant_id=props.get("tenant_id") or self.tenant_id,
+            agent_id=props.get("agent_id") or "",
+            project=props.get("project") or "",
+            session_id=props.get("session_id") or "",
             label=props["label"],
             content=props["content"],
             node_type=NodeType(props["node_type"]),
             tags=list(props.get("tags") or []),
             source_prompt=props.get("source_prompt") or "",
+            evidence_records=[EvidenceRecord.model_validate(item) for item in props.get("evidence_records") or []],
+            valid_from=_parse_datetime(props["valid_from"]) if props.get("valid_from") else None,
+            valid_to=_parse_datetime(props["valid_to"]) if props.get("valid_to") else None,
             created_at=_parse_datetime(props["created_at"]),
             updated_at=_parse_datetime(props["updated_at"]),
             access_count=int(props.get("access_count") or 0),
@@ -1204,6 +1581,13 @@ class Neo4jMemoryGraph:
         best_match: tuple[Node, float] | None = None
 
         for existing_node in existing_nodes:
+            if not _scope_matches(
+                existing_node,
+                agent_id=node.agent_id,
+                project=node.project,
+                session_id=node.session_id,
+            ):
+                continue
             if not compatible_node_types(node.node_type, existing_node.node_type):
                 continue
             existing_label = normalize_text(existing_node.label)
@@ -1232,6 +1616,13 @@ class Neo4jMemoryGraph:
     def _merge_duplicate_node(self, session: Any, *, existing_node: Node, incoming_node: Node) -> Node:
         merged_tags = list(dict.fromkeys([*existing_node.tags, *incoming_node.tags]))
         updated_source_prompt = existing_node.source_prompt or incoming_node.source_prompt
+        merged_evidence = merge_evidence_records(existing_node.evidence_records, incoming_node.evidence_records)
+        merged_valid_from, merged_valid_to = merge_validity_windows(
+            existing_node.valid_from,
+            incoming_node.valid_from,
+            existing_node.valid_to,
+            incoming_node.valid_to,
+        )
         updated_at = utc_now()
         session.run(
             """
@@ -1239,12 +1630,18 @@ class Neo4jMemoryGraph:
             WHERE n.tenant_id = $tenant_id
             SET n.tags = $tags,
                 n.source_prompt = $source_prompt,
+                n.evidence_records = $evidence_records,
+                n.valid_from = $valid_from,
+                n.valid_to = $valid_to,
                 n.updated_at = $updated_at
             """,
             id=existing_node.id,
             tenant_id=self.tenant_id,
             tags=merged_tags,
             source_prompt=updated_source_prompt,
+            evidence_records=[record.model_dump(mode="json") for record in merged_evidence],
+            valid_from=merged_valid_from.isoformat() if merged_valid_from is not None else None,
+            valid_to=merged_valid_to.isoformat() if merged_valid_to is not None else None,
             updated_at=updated_at.isoformat(),
         ).consume()
         return Node(
@@ -1255,6 +1652,9 @@ class Neo4jMemoryGraph:
             node_type=existing_node.node_type,
             tags=merged_tags,
             source_prompt=updated_source_prompt,
+            evidence_records=merged_evidence,
+            valid_from=merged_valid_from,
+            valid_to=merged_valid_to,
             created_at=existing_node.created_at,
             updated_at=updated_at,
             access_count=existing_node.access_count,
@@ -1357,6 +1757,106 @@ class Neo4jMemoryGraph:
             )
         }
         return [rows[node_id] for node_id in node_ids if node_id in rows]
+
+    def _build_timeline_items(
+        self,
+        *,
+        nodes: list[Node],
+        edges: list[Edge],
+        include_evidence: bool,
+        limit: int,
+    ) -> list[ContextTimelineItem]:
+        items: list[ContextTimelineItem] = []
+        for node in nodes:
+            items.append(
+                ContextTimelineItem(
+                    kind="node_created",
+                    timestamp=node.created_at,
+                    label=node.label,
+                    summary=node.content,
+                    node_id=node.id,
+                )
+            )
+            if node.updated_at != node.created_at:
+                items.append(
+                    ContextTimelineItem(
+                        kind="node_updated",
+                        timestamp=node.updated_at,
+                        label=node.label,
+                        summary=node.content,
+                        node_id=node.id,
+                    )
+                )
+            if include_evidence:
+                for record in node.evidence_records:
+                    items.append(
+                        ContextTimelineItem(
+                            kind="evidence",
+                            timestamp=record.observed_at,
+                            label=node.label,
+                            summary=f"{record.source_role or 'unknown'} turn {record.turn_index}: {record.source_text or node.content}",
+                            node_id=node.id,
+                        )
+                    )
+        node_by_id = {node.id: node for node in nodes}
+        for edge in edges:
+            source_label = node_by_id.get(edge.source_id).label if edge.source_id in node_by_id else edge.source_id[:8]
+            target_label = node_by_id.get(edge.target_id).label if edge.target_id in node_by_id else edge.target_id[:8]
+            items.append(
+                ContextTimelineItem(
+                    kind=f"edge_{edge.relationship.value}",
+                    timestamp=edge.created_at,
+                    label=f"{source_label} -> {target_label}",
+                    summary=edge.relationship.value,
+                    edge_id=edge.id,
+                )
+            )
+        return sorted(
+            items,
+            key=lambda item: (item.timestamp, item.kind, item.label),
+            reverse=True,
+        )[:limit]
+
+    def _build_conflict_entries(
+        self,
+        session: Any,
+        *,
+        edges: list[Edge],
+        include_resolved: bool,
+        limit: int,
+    ) -> list[ConflictEntry]:
+        node_ids = list(dict.fromkeys([edge.source_id for edge in edges] + [edge.target_id for edge in edges]))
+        nodes_by_id = {node.id: node for node in self._fetch_nodes_by_ids(session, node_ids)}
+        entries: list[ConflictEntry] = []
+        for edge in edges:
+            resolved, resolution_note, resolved_at = self._conflict_resolution_state(edge)
+            if resolved and not include_resolved:
+                continue
+            source_node = nodes_by_id.get(edge.source_id)
+            target_node = nodes_by_id.get(edge.target_id)
+            if source_node is None or target_node is None:
+                continue
+            entries.append(
+                ConflictEntry(
+                    edge=edge,
+                    source_node=source_node,
+                    target_node=target_node,
+                    resolved=resolved,
+                    resolution_note=resolution_note,
+                    resolved_at=resolved_at,
+                )
+            )
+            if len(entries) >= limit:
+                break
+        return entries
+
+    def _conflict_resolution_state(self, edge: Edge) -> tuple[bool, str, datetime | None]:
+        metadata = edge.metadata or {}
+        resolved = bool(metadata.get("resolved"))
+        resolution_note = str(metadata.get("resolution_note", "") or "")
+        resolved_at_raw = metadata.get("resolved_at")
+        resolved_at = _parse_datetime(resolved_at_raw) if resolved_at_raw else None
+        return resolved, resolution_note, resolved_at
 
     def _temporal_sort_value(self, node: Node, hints: Any) -> float:
         if hints.recency_mode == "latest":
@@ -1572,6 +2072,9 @@ class Neo4jMemoryGraph:
                 "node_type": props["node_type"],
                 "tags": list(props.get("tags") or []),
                 "source_prompt": props.get("source_prompt") or "",
+                "evidence_records": list(props.get("evidence_records") or []),
+                "valid_from": props.get("valid_from"),
+                "valid_to": props.get("valid_to"),
                 "created_at": props["created_at"],
                 "updated_at": props["updated_at"],
                 "access_count": int(props.get("access_count") or 0),
@@ -1615,6 +2118,7 @@ class Neo4jMemoryGraph:
             CREATE (n:MemoryNode {
                 id: $id, tenant_id: $tenant_id, label: $label, content: $content, node_type: $node_type,
                 tags: $tags, embedding: $embedding, source_prompt: $source_prompt,
+                evidence_records: $evidence_records, valid_from: $valid_from, valid_to: $valid_to,
                 created_at: $created_at, updated_at: $updated_at, access_count: $access_count
             })
             """,
@@ -1626,6 +2130,9 @@ class Neo4jMemoryGraph:
             tags=raw_node.get("tags", []),
             embedding=embedding,
             source_prompt=raw_node.get("source_prompt", ""),
+            evidence_records=raw_node.get("evidence_records", []),
+            valid_from=raw_node.get("valid_from"),
+            valid_to=raw_node.get("valid_to"),
             created_at=raw_node["created_at"],
             updated_at=raw_node["updated_at"],
             access_count=int(raw_node.get("access_count", 0)),
@@ -1643,6 +2150,9 @@ class Neo4jMemoryGraph:
                 n.tags = $tags,
                 n.embedding = $embedding,
                 n.source_prompt = $source_prompt,
+                n.evidence_records = $evidence_records,
+                n.valid_from = $valid_from,
+                n.valid_to = $valid_to,
                 n.created_at = $created_at,
                 n.updated_at = $updated_at,
                 n.access_count = $access_count
@@ -1656,6 +2166,9 @@ class Neo4jMemoryGraph:
             tags=raw_node.get("tags", []),
             embedding=embedding,
             source_prompt=raw_node.get("source_prompt", ""),
+            evidence_records=raw_node.get("evidence_records", []),
+            valid_from=raw_node.get("valid_from"),
+            valid_to=raw_node.get("valid_to"),
             created_at=raw_node["created_at"],
             updated_at=raw_node["updated_at"],
             access_count=int(raw_node.get("access_count", 0)),

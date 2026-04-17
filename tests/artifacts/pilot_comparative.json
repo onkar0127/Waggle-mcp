@@ -17,9 +17,7 @@
       "accuracy": 0.3333333333333333,
       "case_count": 12,
       "metadata": {
-        "model": null,
-        "ollama_url": null,
-        "timeout_seconds": null
+        "runtime": "historical-regex"
       }
     },
     {

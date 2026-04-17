@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from waggle.embeddings import EmbeddingModel
-from waggle.extractor import EXTRACT_MODEL, OLLAMA_TIMEOUT_SECONDS, OLLAMA_URL, extract_with_llm
 from waggle.graph import MemoryGraph
 from waggle.intelligence import extract_conversation_candidates, infer_temporal_hints
 from waggle.models import NodeType
@@ -48,6 +47,7 @@ class ComparativeCaseResult:
     context_tokens: int
     retrieved_ids: list[str]
     gold_support_ids: list[str]
+    failure_label: str = ""
 
 
 @dataclass
@@ -57,6 +57,7 @@ class BenchmarkReport:
     errors: list[str] = field(default_factory=list)
     threshold_sweep: list[MetricSummary] = field(default_factory=list)
     comparative: dict[str, Any] = field(default_factory=dict)
+    stress_eval: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +66,7 @@ class BenchmarkReport:
             "errors": list(self.errors),
             "threshold_sweep": [asdict(metric) for metric in self.threshold_sweep],
             "comparative": self.comparative,
+            "stress_eval": self.stress_eval,
         }
 
 
@@ -84,6 +86,7 @@ def load_benchmark_fixtures(fixtures_dir: Path | str = DEFAULT_FIXTURES_DIR) -> 
     retrieval_cases = json.loads((base / "retrieval_cases.json").read_text(encoding="utf-8"))
     dedup_cases = json.loads((base / "dedup_cases.json").read_text(encoding="utf-8"))
     comparative_eval = json.loads((base / "comparative_eval.json").read_text(encoding="utf-8"))
+    query_stress_cases = json.loads((base / "query_stress_cases.json").read_text(encoding="utf-8"))
 
     # Compute repo-relative path
     try:
@@ -98,6 +101,7 @@ def load_benchmark_fixtures(fixtures_dir: Path | str = DEFAULT_FIXTURES_DIR) -> 
         "retrieval_cases": retrieval_cases,
         "dedup_cases": dedup_cases,
         "comparative_eval": comparative_eval,
+        "query_stress_cases": query_stress_cases,
     }
 
 
@@ -195,31 +199,14 @@ def _extract_fact_id(tags: list[str]) -> str | None:
 def run_extraction_benchmark(
     cases: list[dict[str, Any]],
     *,
-    backend: Literal["regex", "llm"],
-    model: str = EXTRACT_MODEL,
-    ollama_url: str = OLLAMA_URL,
-    timeout_seconds: float = OLLAMA_TIMEOUT_SECONDS,
+    backend: Literal["regex"],
 ) -> MetricSummary:
     passed = 0
     for case in cases:
-        if backend == "regex":
-            candidates = extract_conversation_candidates(
-                user_message=case["user_message"],
-                assistant_response=case["assistant_response"],
-            )
-        else:
-            candidates = extract_with_llm(
-                case["user_message"],
-                case["assistant_response"],
-                model=model,
-                ollama_url=ollama_url,
-                timeout_seconds=timeout_seconds,
-            )
-            if candidates is None:
-                raise BenchmarkRuntimeError(
-                    f"LLM extraction backend unavailable at {ollama_url} using model '{model}' "
-                    f"with timeout {timeout_seconds}s."
-                )
+        candidates = extract_conversation_candidates(
+            user_message=case["user_message"],
+            assistant_response=case["assistant_response"],
+        )
 
         found_types = {_normalize_node_type(candidate["node_type"]) for candidate in candidates}
         if _score_extraction_case(case, found_types):
@@ -233,11 +220,7 @@ def run_extraction_benchmark(
         total=total,
         accuracy=passed / total if total else 0.0,
         case_count=total,
-        metadata={
-            "model": model if backend == "llm" else None,
-            "ollama_url": ollama_url if backend == "llm" else None,
-            "timeout_seconds": timeout_seconds if backend == "llm" else None,
-        },
+        metadata={"runtime": "deterministic-regex"},
     )
 
 
@@ -455,6 +438,7 @@ def _aggregate_case_results(results: list[ComparativeCaseResult]) -> dict[str, A
     exact_scores = [1 if result.exact_support else 0 for result in results]
     token_costs = [result.context_tokens for result in results]
     by_family: dict[str, dict[str, Any]] = {}
+    by_failure_label: dict[str, dict[str, Any]] = {}
 
     for family in sorted({result.task_family for result in results}):
         family_results = [result for result in results if result.task_family == family]
@@ -462,6 +446,15 @@ def _aggregate_case_results(results: list[ComparativeCaseResult]) -> dict[str, A
             "case_count": len(family_results),
             "hit_at_k": sum(1 if result.hit_at_k else 0 for result in family_results) / len(family_results),
             "exact_support": sum(1 if result.exact_support else 0 for result in family_results) / len(family_results),
+        }
+
+    labeled_results = [result for result in results if result.failure_label]
+    for label in sorted({result.failure_label for result in labeled_results}):
+        failure_results = [result for result in labeled_results if result.failure_label == label]
+        by_failure_label[label] = {
+            "case_count": len(failure_results),
+            "hit_at_k": sum(1 if result.hit_at_k else 0 for result in failure_results) / len(failure_results),
+            "exact_support": sum(1 if result.exact_support else 0 for result in failure_results) / len(failure_results),
         }
 
     return {
@@ -474,15 +467,15 @@ def _aggregate_case_results(results: list[ComparativeCaseResult]) -> dict[str, A
             "p95": _percentile(token_costs, 0.95),
         },
         "by_task_family": by_family,
+        "by_failure_label": by_failure_label,
     }
 
 
-def _run_waggle_system(
+def _build_comparative_graph(
     comparative_eval: dict[str, Any],
     *,
     embedding_model: Any,
-    top_k: int,
-) -> tuple[dict[str, Any], list[ComparativeCaseResult]]:
+) -> MemoryGraph:
     graph = _graph(embedding_model)
     for scenario in comparative_eval["scenarios"]:
         for fact in scenario["facts"]:
@@ -493,6 +486,16 @@ def _run_waggle_system(
                 tags=["benchmark", f"fact_id:{fact['id']}", f"scenario:{scenario['id']}"],
             )
             _set_node_timestamp(graph, result.node.id, fact["timestamp"])
+    return graph
+
+
+def _run_waggle_system(
+    comparative_eval: dict[str, Any],
+    *,
+    embedding_model: Any,
+    top_k: int,
+) -> tuple[dict[str, Any], list[ComparativeCaseResult]]:
+    graph = _build_comparative_graph(comparative_eval, embedding_model=embedding_model)
 
     results: list[ComparativeCaseResult] = []
     for case in comparative_eval["queries"]:
@@ -511,6 +514,7 @@ def _run_waggle_system(
                 query_id=case["id"],
                 system="waggle",
                 task_family=case["task_family"],
+                failure_label=case.get("failure_label", ""),
                 hit_at_k=bool(union_ids & gold_ids),
                 exact_support=gold_ids.issubset(union_ids),
                 context_tokens=_estimate_tokens(context_text),
@@ -557,6 +561,7 @@ def _run_rag_system(
                 query_id=case["id"],
                 system=system,
                 task_family=case["task_family"],
+                failure_label=case.get("failure_label", ""),
                 hit_at_k=bool(union_ids & gold_ids),
                 exact_support=gold_ids.issubset(union_ids),
                 context_tokens=_estimate_tokens(context_text),
@@ -602,6 +607,68 @@ def run_comparative_evaluation(
             "systems": system_summaries,
             "per_case": all_case_results,
             "failure_protocol": list(comparative_eval.get("failure_protocol", [])),
+        }
+    except BenchmarkRuntimeError:
+        raise
+    except Exception as exc:
+        raise _embedding_benchmark_error(exc, embedding_model) from exc
+
+
+def run_query_stress_evaluation(
+    comparative_eval: dict[str, Any],
+    query_stress_cases: dict[str, Any],
+    *,
+    embedding_model: Any,
+) -> dict[str, Any]:
+    try:
+        graph = _build_comparative_graph(comparative_eval, embedding_model=embedding_model)
+        system_configs = {
+            "graph_raw": {"top_k": 5, "max_depth": 0},
+            "graph_hybrid": {"top_k": 5, "max_depth": 2},
+        }
+        system_summaries: dict[str, Any] = {}
+        all_case_results: list[dict[str, Any]] = []
+
+        for system_name, config in system_configs.items():
+            results: list[ComparativeCaseResult] = []
+            for case in query_stress_cases["queries"]:
+                subgraph = graph.query(
+                    query=case["query"],
+                    max_nodes=config["top_k"],
+                    max_depth=config["max_depth"],
+                )
+                retrieved_fact_ids = [
+                    fact_id
+                    for node in subgraph.nodes
+                    for fact_id in [_extract_fact_id(node.tags)]
+                    if fact_id is not None
+                ]
+                union_ids = set(retrieved_fact_ids)
+                gold_ids = set(case["gold_support_ids"])
+                context_text = "\n".join(f"{node.label}: {node.content}" for node in subgraph.nodes)
+                results.append(
+                    ComparativeCaseResult(
+                        query_id=case["id"],
+                        system=system_name,
+                        task_family=case["task_family"],
+                        failure_label=case.get("failure_label", ""),
+                        hit_at_k=bool(union_ids & gold_ids),
+                        exact_support=gold_ids.issubset(union_ids),
+                        context_tokens=_estimate_tokens(context_text),
+                        retrieved_ids=retrieved_fact_ids,
+                        gold_support_ids=list(case["gold_support_ids"]),
+                    )
+                )
+            summary = _aggregate_case_results(results)
+            summary["parameters"] = config
+            system_summaries[system_name] = summary
+            all_case_results.extend(asdict(result) for result in results)
+
+        return {
+            "case_count": len(query_stress_cases["queries"]),
+            "task_families": sorted({case["task_family"] for case in query_stress_cases["queries"]}),
+            "systems": system_summaries,
+            "per_case": all_case_results,
         }
     except BenchmarkRuntimeError:
         raise
@@ -671,15 +738,30 @@ def build_markdown_summary(report: BenchmarkReport) -> str:
     )
     for item in report.comparative.get("failure_protocol", []):
         lines.append(f"- {item}")
+    if report.stress_eval:
+        lines.extend(
+            [
+                "",
+                "## Query Stress Eval",
+                "",
+                f"- Cases: {report.stress_eval['case_count']}",
+                f"- Families: {', '.join(report.stress_eval['task_families'])}",
+                "",
+                "| System | Hit@k | Exact support | Mean tokens |",
+                "|--------|-------|---------------|-------------|",
+            ]
+        )
+        for system, metrics in report.stress_eval["systems"].items():
+            lines.append(
+                f"| {system} | {metrics['hit_at_k']:.0%} | {metrics['exact_support']:.0%} | "
+                f"{metrics['context_tokens']['mean']:.1f} |"
+            )
     return "\n".join(lines) + "\n"
 
 
 def run_benchmarks(
     *,
-    extraction_backend: Literal["regex", "llm", "both"] = "both",
-    model: str = EXTRACT_MODEL,
-    ollama_url: str = OLLAMA_URL,
-    ollama_timeout_seconds: float = OLLAMA_TIMEOUT_SECONDS,
+    extraction_backend: Literal["regex"] = "regex",
     fixtures_dir: Path | str = DEFAULT_FIXTURES_DIR,
     embedding_model: Any | None = None,
     dedup_threshold: float | None = None,
@@ -697,28 +779,14 @@ def run_benchmarks(
             "dedup_cases": len(fixtures["dedup_cases"]),
             "comparative_scenarios": len(fixtures["comparative_eval"]["scenarios"]),
             "comparative_queries": len(fixtures["comparative_eval"]["queries"]),
+            "query_stress_cases": len(fixtures["query_stress_cases"]["queries"]),
         },
         metrics=[],
     )
 
-    if extraction_backend in ("regex", "both"):
-        report.metrics.append(
-            run_extraction_benchmark(fixtures["extraction_cases"], backend="regex")
-        )
-
-    if extraction_backend in ("llm", "both"):
-        try:
-            report.metrics.append(
-                run_extraction_benchmark(
-                    fixtures["extraction_cases"],
-                    backend="llm",
-                    model=model,
-                    ollama_url=ollama_url,
-                    timeout_seconds=ollama_timeout_seconds,
-                )
-            )
-        except BenchmarkRuntimeError as exc:
-            report.errors.append(str(exc))
+    report.metrics.append(
+        run_extraction_benchmark(fixtures["extraction_cases"], backend="regex")
+    )
 
     embedding_ready = True
 
@@ -756,6 +824,14 @@ def run_benchmarks(
             )
         except BenchmarkRuntimeError as exc:
             report.errors.append(str(exc))
+        try:
+            report.stress_eval = run_query_stress_evaluation(
+                fixtures["comparative_eval"],
+                fixtures["query_stress_cases"],
+                embedding_model=model_instance,
+            )
+        except BenchmarkRuntimeError as exc:
+            report.errors.append(str(exc))
     return report
 
 
@@ -763,8 +839,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Reproducible local benchmark harness for waggle-mcp.")
     parser.add_argument(
         "--extraction-backend",
-        choices=["regex", "llm", "both"],
-        default=os.getenv("WAGGLE_BENCHMARK_EXTRACTION_BACKEND", "both"),
+        choices=["regex"],
+        default=os.getenv("WAGGLE_BENCHMARK_EXTRACTION_BACKEND", "regex"),
         help="Which extraction benchmark(s) to run.",
     )
     parser.add_argument(
@@ -773,22 +849,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["waggle", "rag_naive", "rag_tuned", "all"],
         default=["all"],
         help="Comparative systems to run. 'all' expands to waggle, rag_naive, rag_tuned.",
-    )
-    parser.add_argument(
-        "--ollama-model",
-        default=os.getenv("WAGGLE_EXTRACT_MODEL", EXTRACT_MODEL),
-        help="Ollama model used for the LLM extraction benchmark.",
-    )
-    parser.add_argument(
-        "--ollama-url",
-        default=os.getenv("WAGGLE_OLLAMA_URL", OLLAMA_URL),
-        help="Base URL for the local Ollama instance used in the LLM extraction benchmark.",
-    )
-    parser.add_argument(
-        "--ollama-timeout-seconds",
-        type=float,
-        default=float(os.getenv("WAGGLE_OLLAMA_TIMEOUT_SECONDS", str(OLLAMA_TIMEOUT_SECONDS))),
-        help="Timeout for each Ollama extraction request.",
     )
     parser.add_argument(
         "--fixtures-dir",
@@ -821,9 +881,6 @@ def main(argv: list[str] | None = None) -> int:
     selected_systems = ["waggle", "rag_naive", "rag_tuned"] if "all" in args.systems else args.systems
     report = run_benchmarks(
         extraction_backend=args.extraction_backend,
-        model=args.ollama_model,
-        ollama_url=args.ollama_url,
-        ollama_timeout_seconds=args.ollama_timeout_seconds,
         fixtures_dir=args.fixtures_dir,
         dedup_threshold=args.dedup_threshold,
         embedding_model=EmbeddingModel(args.embedding_model),
@@ -839,7 +896,8 @@ def main(argv: list[str] | None = None) -> int:
         f"retrieval_queries={report.fixtures['retrieval_queries']} "
         f"dedup_cases={report.fixtures['dedup_cases']} "
         f"comparative_scenarios={report.fixtures['comparative_scenarios']} "
-        f"comparative_queries={report.fixtures['comparative_queries']}"
+        f"comparative_queries={report.fixtures['comparative_queries']} "
+        f"query_stress_cases={report.fixtures['query_stress_cases']}"
     )
     for metric in report.metrics:
         print(_format_metric(metric))
@@ -852,6 +910,15 @@ def main(argv: list[str] | None = None) -> int:
     if report.comparative:
         print("comparative systems:")
         for system, metrics in report.comparative["systems"].items():
+            print(
+                f"  {system:<10} hit@k={metrics['hit_at_k']:.0%} "
+                f"exact={metrics['exact_support']:.0%} "
+                f"tokens(mean/median/p95)={metrics['context_tokens']['mean']:.1f}/"
+                f"{metrics['context_tokens']['median']:.1f}/{metrics['context_tokens']['p95']:.1f}"
+            )
+    if report.stress_eval:
+        print("query stress systems:")
+        for system, metrics in report.stress_eval["systems"].items():
             print(
                 f"  {system:<10} hit@k={metrics['hit_at_k']:.0%} "
                 f"exact={metrics['exact_support']:.0%} "

@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 
+from waggle import __version__
 from waggle.config import AppConfig
 from waggle.embeddings import EmbeddingModel
 from waggle.errors import (
@@ -39,30 +40,62 @@ from waggle.graph import MemoryGraph
 from waggle.logging_utils import configure_logging
 from waggle.metrics import MetricsRegistry
 from waggle.models import (
+    ConflictEntry,
+    ConflictListResult,
+    ContextBundleExportResult,
+    ContextScopeResult,
     GraphDiffResult,
     GraphStats,
     Node,
+    NodeHistoryResult,
     NodeType,
     ObservationResult,
     PrimeContextResult,
     RelationType,
     SubgraphResult,
+    TimelineResult,
     TopicResult,
 )
 from waggle.rate_limit import RateLimiter
 from waggle.runtime_context import runtime_context
 from waggle.serializer import (
+    serialize_conflict_entry,
+    serialize_conflicts,
+    serialize_context_bundle_export,
     serialize_graph_diff,
+    serialize_node_history,
     serialize_observation_result,
     serialize_prime_context,
     serialize_recent_nodes,
     serialize_stats,
     serialize_subgraph,
+    serialize_timeline,
     serialize_topics,
 )
 
 LOGGER = logging.getLogger(__name__)
 WRITE_HEAVY_TOOLS = {"store_node", "store_edge", "decompose_and_store", "observe_conversation", "import_graph_backup"}
+REQUIRED_RUNTIME_METHODS = (
+    "export_context_bundle",
+    "list_context_scopes",
+    "get_node_history",
+    "timeline",
+    "list_conflicts",
+    "resolve_conflict",
+)
+
+
+def _assert_runtime_feature_parity() -> None:
+    missing = [name for name in REQUIRED_RUNTIME_METHODS if not hasattr(MemoryGraph, name)]
+    if not missing:
+        return
+    joined = ", ".join(missing)
+    raise RuntimeError(
+        "Detected a stale waggle runtime on the import path. Missing methods: "
+        f"{joined}. This usually means an older copied package in site-packages is "
+        "shadowing the current source tree or editable install. Recreate the virtualenv "
+        "or uninstall old waggle/graph-memory-mcp builds before running waggle-mcp."
+    )
 
 
 def _build_backend(config: AppConfig) -> Any:
@@ -158,6 +191,9 @@ class WaggleServer:
                             "description": "Optional original prompt that produced this knowledge.",
                             "default": "",
                         },
+                        "agent_id": {"type": "string", "default": ""},
+                        "project": {"type": "string", "default": ""},
+                        "session_id": {"type": "string", "default": ""},
                     },
                     "required": ["label", "content", "node_type"],
                 },
@@ -202,6 +238,9 @@ class WaggleServer:
                         "query": {"type": "string", "description": "Natural-language search query."},
                         "max_nodes": {"type": "integer", "default": 20, "minimum": 1},
                         "max_depth": {"type": "integer", "default": 2, "minimum": 0},
+                        "agent_id": {"type": "string", "default": ""},
+                        "project": {"type": "string", "default": ""},
+                        "session_id": {"type": "string", "default": ""},
                     },
                     "required": ["query"],
                 },
@@ -216,6 +255,60 @@ class WaggleServer:
                         "max_depth": {"type": "integer", "default": 2, "minimum": 0},
                     },
                     "required": ["node_id"],
+                },
+            ),
+            types.Tool(
+                name="get_node_history",
+                description="Inspect one node's evidence, validity window, and connected context.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "node_id": {"type": "string"},
+                        "max_depth": {"type": "integer", "default": 2, "minimum": 0},
+                    },
+                    "required": ["node_id"],
+                },
+            ),
+            types.Tool(
+                name="list_context_scopes",
+                description="List known agent, project, and session scopes stored in the current tenant graph.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            types.Tool(
+                name="timeline",
+                description="Build a chronological view of memory changes for a node, a query result, or the tenant.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "node_id": {"type": "string"},
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "default": 25, "minimum": 1},
+                        "max_depth": {"type": "integer", "default": 2, "minimum": 0},
+                        "include_evidence": {"type": "boolean", "default": True},
+                    },
+                },
+            ),
+            types.Tool(
+                name="list_conflicts",
+                description="List contradiction and update edges, with unresolved conflicts shown by default.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "include_resolved": {"type": "boolean", "default": False},
+                        "limit": {"type": "integer", "default": 25, "minimum": 1},
+                    },
+                },
+            ),
+            types.Tool(
+                name="resolve_conflict",
+                description="Mark a contradiction or update edge as resolved without deleting the underlying history.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "edge_id": {"type": "string"},
+                        "resolution_note": {"type": "string", "default": ""},
+                    },
+                    "required": ["edge_id"],
                 },
             ),
             types.Tool(
@@ -257,6 +350,9 @@ class WaggleServer:
                     "properties": {
                         "user_message": {"type": "string"},
                         "assistant_response": {"type": "string"},
+                        "agent_id": {"type": "string", "default": ""},
+                        "project": {"type": "string", "default": ""},
+                        "session_id": {"type": "string", "default": ""},
                     },
                     "required": ["user_message", "assistant_response"],
                 },
@@ -269,7 +365,14 @@ class WaggleServer:
             types.Tool(
                 name="prime_context",
                 description="Build a compact context brief for the start of a new conversation.",
-                inputSchema={"type": "object", "properties": {"project": {"type": "string", "default": ""}}},
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string", "default": ""},
+                        "agent_id": {"type": "string", "default": ""},
+                        "session_id": {"type": "string", "default": ""},
+                    },
+                },
             ),
             types.Tool(
                 name="get_topics",
@@ -292,6 +395,28 @@ class WaggleServer:
                 name="export_graph_backup",
                 description="Export the current graph as a portable JSON backup.",
                 inputSchema={"type": "object", "properties": {"output_path": {"type": "string"}}},
+            ),
+            types.Tool(
+                name="export_context_bundle",
+                description="Export a portable Markdown/JSON context bundle for handing memory to another AI.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["prime", "query", "graph"], "default": "prime"},
+                        "query": {"type": "string"},
+                        "project": {"type": "string", "default": ""},
+                        "agent_id": {"type": "string", "default": ""},
+                        "session_id": {"type": "string", "default": ""},
+                        "max_nodes": {"type": "integer", "default": 25},
+                        "max_depth": {"type": "integer", "default": 2},
+                        "format": {"type": "string", "enum": ["markdown", "json", "both"], "default": "both"},
+                        "output_path": {"type": "string"},
+                        "include_edges": {"type": "boolean", "default": True},
+                        "include_timestamps": {"type": "boolean", "default": True},
+                        "include_source_prompt": {"type": "boolean", "default": False},
+                        "audience": {"type": "string", "enum": ["llm", "human"], "default": "llm"},
+                    },
+                },
             ),
             types.Tool(
                 name="import_graph_backup",
@@ -378,6 +503,9 @@ class WaggleServer:
                         node_type=NodeType(arguments["node_type"]),
                         tags=arguments.get("tags", []),
                         source_prompt=arguments.get("source_prompt", ""),
+                        agent_id=arguments.get("agent_id", ""),
+                        project=arguments.get("project", ""),
+                        session_id=arguments.get("session_id", ""),
                     )
                     node = store_result.node
                     text = (
@@ -433,14 +561,47 @@ class WaggleServer:
                         query=arguments["query"],
                         max_nodes=int(arguments.get("max_nodes", 20)),
                         max_depth=int(arguments.get("max_depth", 2)),
+                        agent_id=arguments.get("agent_id", ""),
+                        project=arguments.get("project", ""),
+                        session_id=arguments.get("session_id", ""),
                     )
                     result = self._tool_result(
                         serialize_subgraph(subgraph),
                         self._subgraph_payload(subgraph),
                     )
+                elif name == "list_context_scopes":
+                    scopes = graph.list_context_scopes()
+                    result = self._tool_result(
+                        f"Known scopes: {len(scopes.agent_ids)} agents, {len(scopes.projects)} projects, {len(scopes.session_ids)} sessions.",
+                        self._context_scope_payload(scopes),
+                    )
                 elif name == "get_related":
                     subgraph = graph.get_related(node_id=arguments["node_id"], max_depth=int(arguments.get("max_depth", 2)))
                     result = self._tool_result(serialize_subgraph(subgraph), self._subgraph_payload(subgraph))
+                elif name == "get_node_history":
+                    history = graph.get_node_history(node_id=arguments["node_id"], max_depth=int(arguments.get("max_depth", 2)))
+                    result = self._tool_result(serialize_node_history(history), self._node_history_payload(history))
+                elif name == "timeline":
+                    timeline = graph.timeline(
+                        node_id=arguments.get("node_id", ""),
+                        query=arguments.get("query", ""),
+                        limit=int(arguments.get("limit", 25)),
+                        max_depth=int(arguments.get("max_depth", 2)),
+                        include_evidence=bool(arguments.get("include_evidence", True)),
+                    )
+                    result = self._tool_result(serialize_timeline(timeline), self._timeline_payload(timeline))
+                elif name == "list_conflicts":
+                    conflicts = graph.list_conflicts(
+                        include_resolved=bool(arguments.get("include_resolved", False)),
+                        limit=int(arguments.get("limit", 25)),
+                    )
+                    result = self._tool_result(serialize_conflicts(conflicts), self._conflict_list_payload(conflicts))
+                elif name == "resolve_conflict":
+                    resolved = graph.resolve_conflict(
+                        edge_id=arguments["edge_id"],
+                        resolution_note=arguments.get("resolution_note", ""),
+                    )
+                    result = self._tool_result(serialize_conflict_entry(resolved), self._conflict_entry_payload(resolved))
                 elif name == "update_node":
                     node = graph.update_node(
                         node_id=arguments["node_id"],
@@ -462,6 +623,9 @@ class WaggleServer:
                     observation = graph.observe_conversation(
                         user_message=arguments["user_message"],
                         assistant_response=arguments["assistant_response"],
+                        agent_id=arguments.get("agent_id", ""),
+                        project=arguments.get("project", ""),
+                        session_id=arguments.get("session_id", ""),
                     )
                     result = self._tool_result(
                         serialize_observation_result(observation),
@@ -471,7 +635,11 @@ class WaggleServer:
                     diff = graph.graph_diff(since=arguments.get("since", "24h"))
                     result = self._tool_result(serialize_graph_diff(diff), self._graph_diff_payload(diff))
                 elif name == "prime_context":
-                    context_result = graph.prime_context(project=arguments.get("project", ""))
+                    context_result = graph.prime_context(
+                        project=arguments.get("project", ""),
+                        agent_id=arguments.get("agent_id", ""),
+                        session_id=arguments.get("session_id", ""),
+                    )
                     result = self._tool_result(serialize_prime_context(context_result), self._prime_context_payload(context_result))
                 elif name == "get_topics":
                     topics = graph.get_topics()
@@ -505,6 +673,26 @@ class WaggleServer:
                             "node_count": backup.node_count,
                             "edge_count": backup.edge_count,
                         },
+                    )
+                elif name == "export_context_bundle":
+                    exported = graph.export_context_bundle(
+                        mode=arguments.get("mode", "prime"),
+                        query=arguments.get("query", ""),
+                        project=arguments.get("project", ""),
+                        agent_id=arguments.get("agent_id", ""),
+                        session_id=arguments.get("session_id", ""),
+                        max_nodes=int(arguments.get("max_nodes", 25)),
+                        max_depth=int(arguments.get("max_depth", 2)),
+                        format=arguments.get("format", "both"),
+                        output_path=arguments.get("output_path"),
+                        include_edges=bool(arguments.get("include_edges", True)),
+                        include_timestamps=bool(arguments.get("include_timestamps", True)),
+                        include_source_prompt=bool(arguments.get("include_source_prompt", False)),
+                        audience=arguments.get("audience", "llm"),
+                    )
+                    result = self._tool_result(
+                        serialize_context_bundle_export(exported),
+                        self._context_bundle_payload(exported),
                     )
                 elif name == "import_graph_backup":
                     imported = graph.import_graph_backup(input_path=arguments["input_path"])
@@ -568,11 +756,29 @@ class WaggleServer:
         return {
             "id": node.id,
             "tenant_id": node.tenant_id,
+            "agent_id": node.agent_id,
+            "project": node.project,
+            "session_id": node.session_id,
             "label": node.label,
             "content": node.content,
             "node_type": node.node_type.value,
             "tags": node.tags,
             "source_prompt": node.source_prompt,
+            "evidence_records": [
+                {
+                    "evidence_id": record.evidence_id,
+                    "session_id": record.session_id,
+                    "turn_index": record.turn_index,
+                    "source_role": record.source_role,
+                    "source_text": record.source_text,
+                    "source_span_start": record.source_span_start,
+                    "source_span_end": record.source_span_end,
+                    "observed_at": record.observed_at.isoformat(),
+                }
+                for record in node.evidence_records
+            ],
+            "valid_from": node.valid_from.isoformat() if node.valid_from is not None else None,
+            "valid_to": node.valid_to.isoformat() if node.valid_to is not None else None,
             "created_at": node.created_at.isoformat(),
             "updated_at": node.updated_at.isoformat(),
             "access_count": node.access_count,
@@ -614,6 +820,52 @@ class WaggleServer:
             ],
         }
 
+    def _node_history_payload(self, result: NodeHistoryResult) -> dict[str, Any]:
+        return {
+            "node": self._node_payload(result.node),
+            "related_nodes": [self._node_payload(node) for node in result.related_nodes],
+            "edges": [self._edge_payload(edge) for edge in result.edges],
+        }
+
+    def _timeline_payload(self, result: TimelineResult) -> dict[str, Any]:
+        return {
+            "scope": result.scope,
+            "items": [
+                {
+                    "kind": item.kind,
+                    "timestamp": item.timestamp.isoformat(),
+                    "label": item.label,
+                    "summary": item.summary,
+                    "node_id": item.node_id,
+                    "edge_id": item.edge_id,
+                }
+                for item in result.items
+            ],
+        }
+
+    def _conflict_entry_payload(self, entry: ConflictEntry) -> dict[str, Any]:
+        return {
+            "edge": self._edge_payload(entry.edge),
+            "source_node": self._node_payload(entry.source_node),
+            "target_node": self._node_payload(entry.target_node),
+            "resolved": entry.resolved,
+            "resolution_note": entry.resolution_note,
+            "resolved_at": entry.resolved_at.isoformat() if entry.resolved_at is not None else None,
+        }
+
+    def _conflict_list_payload(self, result: ConflictListResult) -> dict[str, Any]:
+        return {
+            "include_resolved": result.include_resolved,
+            "conflicts": [self._conflict_entry_payload(entry) for entry in result.conflicts],
+        }
+
+    def _context_scope_payload(self, result: ContextScopeResult) -> dict[str, Any]:
+        return {
+            "agent_ids": result.agent_ids,
+            "projects": result.projects,
+            "session_ids": result.session_ids,
+        }
+
     def _graph_diff_payload(self, result: GraphDiffResult) -> dict[str, Any]:
         return {
             "since": result.since,
@@ -631,6 +883,25 @@ class WaggleServer:
             "total_nodes_in_graph": result.total_nodes_in_graph,
             "nodes": [self._node_payload(node) for node in result.nodes],
             "edges": [self._edge_payload(edge) for edge in result.edges],
+        }
+
+    def _context_bundle_payload(self, result: ContextBundleExportResult) -> dict[str, Any]:
+        return {
+            "tenant_id": result.tenant_id,
+            "project": result.project,
+            "mode": result.mode,
+            "query": result.query,
+            "summary": result.summary,
+            "markdown_path": result.markdown_path,
+            "json_path": result.json_path,
+            "node_count": result.node_count,
+            "edge_count": result.edge_count,
+            "render_hints": {
+                "token_estimate": result.bundle.render_hints.token_estimate,
+                "recommended_paste_order": result.bundle.render_hints.recommended_paste_order,
+                "truncation_flags": result.bundle.render_hints.truncation_flags,
+                "chunk_count": result.bundle.render_hints.chunk_count,
+            },
         }
 
     def _topic_payload(self, result: TopicResult) -> dict[str, Any]:
@@ -679,6 +950,9 @@ class WaggleServer:
             self._assert_payload_size(arguments.get("label", ""), limit, "store_node.label")
             self._assert_payload_size(arguments.get("content", ""), limit, "store_node.content")
             self._assert_payload_size(arguments.get("source_prompt", ""), limit, "store_node.source_prompt")
+            self._assert_payload_size(arguments.get("agent_id", ""), limit, "store_node.agent_id")
+            self._assert_payload_size(arguments.get("project", ""), limit, "store_node.project")
+            self._assert_payload_size(arguments.get("session_id", ""), limit, "store_node.session_id")
             return
         if name == "decompose_and_store":
             self._assert_payload_size(arguments.get("content", ""), limit, "decompose_and_store.content")
@@ -687,6 +961,30 @@ class WaggleServer:
         if name == "observe_conversation":
             self._assert_payload_size(arguments.get("user_message", ""), limit, "observe_conversation.user_message")
             self._assert_payload_size(arguments.get("assistant_response", ""), limit, "observe_conversation.assistant_response")
+            self._assert_payload_size(arguments.get("agent_id", ""), limit, "observe_conversation.agent_id")
+            self._assert_payload_size(arguments.get("project", ""), limit, "observe_conversation.project")
+            self._assert_payload_size(arguments.get("session_id", ""), limit, "observe_conversation.session_id")
+            return
+        if name == "query_graph":
+            self._assert_payload_size(arguments.get("query", ""), limit, "query_graph.query")
+            self._assert_payload_size(arguments.get("agent_id", ""), limit, "query_graph.agent_id")
+            self._assert_payload_size(arguments.get("project", ""), limit, "query_graph.project")
+            self._assert_payload_size(arguments.get("session_id", ""), limit, "query_graph.session_id")
+            return
+        if name == "export_context_bundle":
+            self._assert_payload_size(arguments.get("query", ""), limit, "export_context_bundle.query")
+            self._assert_payload_size(arguments.get("project", ""), limit, "export_context_bundle.project")
+            self._assert_payload_size(arguments.get("agent_id", ""), limit, "export_context_bundle.agent_id")
+            self._assert_payload_size(arguments.get("session_id", ""), limit, "export_context_bundle.session_id")
+            self._assert_payload_size(arguments.get("output_path", ""), limit, "export_context_bundle.output_path")
+            return
+        if name == "timeline":
+            self._assert_payload_size(arguments.get("query", ""), limit, "timeline.query")
+            self._assert_payload_size(arguments.get("node_id", ""), limit, "timeline.node_id")
+            return
+        if name == "resolve_conflict":
+            self._assert_payload_size(arguments.get("edge_id", ""), limit, "resolve_conflict.edge_id")
+            self._assert_payload_size(arguments.get("resolution_note", ""), limit, "resolve_conflict.resolution_note")
 
     @staticmethod
     def _assert_payload_size(value: Any, limit: int, field_name: str) -> None:
@@ -893,6 +1191,7 @@ def run_http(config: AppConfig) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="waggle-mcp")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("serve")
 
@@ -913,6 +1212,21 @@ def _build_parser() -> argparse.ArgumentParser:
     migrate_sqlite = subparsers.add_parser("migrate-sqlite")
     migrate_sqlite.add_argument("--db-path", required=True)
     migrate_sqlite.add_argument("--tenant-id", required=True)
+
+    export_context_bundle = subparsers.add_parser("export-context-bundle")
+    export_context_bundle.add_argument("--mode", choices=["prime", "query", "graph"], default="prime")
+    export_context_bundle.add_argument("--query", default="")
+    export_context_bundle.add_argument("--project", default="")
+    export_context_bundle.add_argument("--agent-id", default="")
+    export_context_bundle.add_argument("--session-id", default="")
+    export_context_bundle.add_argument("--max-nodes", type=int, default=25)
+    export_context_bundle.add_argument("--max-depth", type=int, default=2)
+    export_context_bundle.add_argument("--format", choices=["markdown", "json", "both"], default="both")
+    export_context_bundle.add_argument("--output-path", default=None)
+    export_context_bundle.add_argument("--include-edges", action=argparse.BooleanOptionalAction, default=True)
+    export_context_bundle.add_argument("--include-timestamps", action=argparse.BooleanOptionalAction, default=True)
+    export_context_bundle.add_argument("--include-source-prompt", action=argparse.BooleanOptionalAction, default=False)
+    export_context_bundle.add_argument("--audience", choices=["llm", "human"], default="llm")
 
     subparsers.add_parser("init", help="Interactive setup wizard — configure an MCP client to use waggle-mcp.")
     return parser
@@ -965,6 +1279,24 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
             )
         )
         temp_path.unlink(missing_ok=True)
+        return 0
+    if args.command == "export-context-bundle":
+        exported = backend.export_context_bundle(
+            mode=args.mode,
+            query=args.query,
+            project=args.project,
+            agent_id=getattr(args, "agent_id", ""),
+            session_id=getattr(args, "session_id", ""),
+            max_nodes=args.max_nodes,
+            max_depth=args.max_depth,
+            format=args.format,
+            output_path=args.output_path,
+            include_edges=args.include_edges,
+            include_timestamps=args.include_timestamps,
+            include_source_prompt=args.include_source_prompt,
+            audience=args.audience,
+        )
+        print(json.dumps(exported.model_dump(mode="json"), indent=2))
         return 0
     raise ValidationFailure(f"Unknown command: {args.command}")
 
@@ -1022,19 +1354,9 @@ def _python_exe() -> str:
     return sys.executable
 
 
-def _package_root() -> str:
-    """Return a best-effort src/ directory for PYTHONPATH."""
-    # Walk up from this file looking for src/waggle
-    here = Path(__file__).resolve().parent
-    candidate = here.parent  # expected: .../src
-    if (candidate / "waggle").is_dir():
-        return str(candidate)
-    return str(here.parent)
-
-
 # ── client config writers ────────────────────────────────────────────────────
 
-def _write_claude_desktop(db_path: str, python_exe: str, src_root: str) -> Path:
+def _write_claude_desktop(db_path: str, python_exe: str) -> Path:
     """Write ~/.config/claude/claude_desktop_config.json (macOS/Linux)."""
     if sys.platform == "darwin":
         config_dir = Path.home() / "Library" / "Application Support" / "Claude"
@@ -1055,7 +1377,6 @@ def _write_claude_desktop(db_path: str, python_exe: str, src_root: str) -> Path:
         "command": python_exe,
         "args": ["-m", "waggle.server"],
         "env": {
-            "PYTHONPATH": src_root,
             "WAGGLE_TRANSPORT": "stdio",
             "WAGGLE_BACKEND": "sqlite",
             "WAGGLE_DB_PATH": db_path,
@@ -1067,7 +1388,7 @@ def _write_claude_desktop(db_path: str, python_exe: str, src_root: str) -> Path:
     return config_file
 
 
-def _write_cursor(db_path: str, python_exe: str, src_root: str) -> Path:
+def _write_cursor(db_path: str, python_exe: str) -> Path:
     """Write ~/.cursor/mcp.json."""
     config_dir = Path.home() / ".cursor"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -1085,7 +1406,6 @@ def _write_cursor(db_path: str, python_exe: str, src_root: str) -> Path:
         "command": python_exe,
         "args": ["-m", "waggle.server"],
         "env": {
-            "PYTHONPATH": src_root,
             "WAGGLE_TRANSPORT": "stdio",
             "WAGGLE_BACKEND": "sqlite",
             "WAGGLE_DB_PATH": db_path,
@@ -1097,16 +1417,14 @@ def _write_cursor(db_path: str, python_exe: str, src_root: str) -> Path:
     return config_file
 
 
-def _write_codex(db_path: str, python_exe: str, src_root: str) -> Path:
+def _write_codex(db_path: str, python_exe: str) -> Path:
     """Write ~/codex_mcp.toml (printable TOML snippet — Codex uses a TOML file)."""
     config_file = Path.home() / "codex_mcp.toml"
     toml_block = (
         '[mcp_servers.waggle]\n'
         f'command = "{python_exe}"\n'
         'args = ["-m", "waggle.server"]\n'
-        f'cwd = "{Path(src_root).parent}"\n'
         'env = {\n'
-        f'  PYTHONPATH = "{src_root}",\n'
         '  WAGGLE_TRANSPORT = "stdio",\n'
         '  WAGGLE_BACKEND = "sqlite",\n'
         f'  WAGGLE_DB_PATH = "{db_path}",\n'
@@ -1118,14 +1436,13 @@ def _write_codex(db_path: str, python_exe: str, src_root: str) -> Path:
     return config_file
 
 
-def _write_other(db_path: str, python_exe: str, src_root: str) -> Path:
+def _write_other(db_path: str, python_exe: str) -> Path:
     """Write a generic JSON snippet to ~/waggle-mcp-config.json."""
     config_file = Path.home() / "waggle-mcp-config.json"
     snippet = {
         "command": python_exe,
         "args": ["-m", "waggle.server"],
         "env": {
-            "PYTHONPATH": src_root,
             "WAGGLE_TRANSPORT": "stdio",
             "WAGGLE_BACKEND": "sqlite",
             "WAGGLE_DB_PATH": db_path,
@@ -1166,14 +1483,13 @@ def _run_init() -> int:
     db_path = str(Path(db_path_raw).expanduser().resolve())
 
     python_exe = _python_exe()
-    src_root = _package_root()
 
     print()
 
     # Write client config
     writer = _CLIENT_WRITERS[client]
     try:
-        config_file = writer(db_path, python_exe, src_root)
+        config_file = writer(db_path, python_exe)
         _ok(f"Config written to {config_file}")
     except OSError as exc:
         _fail(f"Could not write config: {exc}")
@@ -1195,6 +1511,7 @@ def _run_init() -> int:
 
 
 def main() -> None:
+    _assert_runtime_feature_parity()
     parser = _build_parser()
     args = parser.parse_args()
     command = args.command or "serve"
