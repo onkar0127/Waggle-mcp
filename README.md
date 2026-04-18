@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Persistent, structured memory for AI agents — up to 4× fewer tokens than chunk-based retrieval.</strong><br/>
+  <strong>Persistent, structured memory for AI agents — typically lower-token than chunk-based retrieval, often 2-4× on factual lookups.</strong><br/>
   Your LLM remembers facts, decisions, and context <em>across every conversation</em>, backed by a real knowledge graph.
 </p>
 
@@ -33,7 +33,7 @@
 | Flat notes and chunks | Typed nodes and edges: decisions, reasons, contradictions |
 | "What changed?" requires replaying logs | Temporal queries and diffs are first-class |
 
-Waggle yields **up to ~4× fewer tokens** than naive chunked retrieval on factual queries. Graph-traversal queries spend more tokens to include necessary reasoning context such as updates, contradictions, and dependencies.
+Waggle often uses materially fewer tokens than naive chunked retrieval on factual lookups, while graph-traversal queries intentionally spend more context to include reasoning chains such as updates, contradictions, and dependencies.
 
 ---
 
@@ -86,22 +86,6 @@ Typical pattern:
 - Antigravity can use Waggle as its persistent memory backend through MCP.
 - Conversation turns can be extracted with `observe_conversation`.
 - Linked context can be exported with `export_context_bundle` or edited through the Markdown vault workflow.
-
-### What The Agent Actually Uses
-
-Common memory tools:
-- `observe_conversation`: extract memory from a completed turn
-- `store_node`: save one fact, note, preference, or decision directly
-- `store_edge`: connect two nodes explicitly
-- `query_graph`: retrieve relevant graph context
-- `prime_context`: build a short briefing for a fresh session
-- `list_conflicts` / `resolve_conflict`: inspect and resolve contradictions
-- `export_context_bundle`: hand memory to another model as Markdown or JSON
-
-Important:
-- `store_node` alone does not create edges.
-- Connected context comes from `store_edge`, `observe_conversation`, `decompose_and_store`, and automatic contradiction/update detection.
-- The graph-aware retrieval tools are what bring that connected context back to the model.
 
 For a built-in CLI explanation of the feature surface, run:
 
@@ -161,18 +145,31 @@ Waggle performance is verified against checked-in fixtures and automated regress
 | Extraction | 25-case deterministic fixture | `100.0%` |
 | Retrieval | 18-query retrieval fixture | `83.3% Hit@k` |
 | Query stress | 40 adversarial retrieval-only cases | `97.5% Hit@k`, `97.5% exact support` |
-| Deduplication | 22 cases (semi-semantic) | `77.3% (17/22)`, zero false merges |
+| Deduplication | 22 cases (semi-semantic) | `0` false merges at the selected threshold; `77.3%` overall due to conservative false negatives |
 | Automated tests | Infrastructure & logic | `91 passed` |
 
 ### External Benchmarks
 | Benchmark | Coverage | Metric | Status |
 |-----------|----------|--------|--------|
-| **LongMemEval** | 500 questions | `97.4% R@5` | Verified (Held-out split: 81.6% deterministic) |
+| **LongMemEval** | 500 questions | `81.6% R@5` held-out deterministic | Verified |
 
+- **LongMemEval note**: The checked-in full-split `97.4% R@5` result is useful as a retrieval ceiling on the saved benchmark setup, but the held-out `81.6%` split is the more honest number for generalization.
 - **Deduplication**: Zero false-positive merges across the threshold sweep. Accuracy limited by conservative similarity bounds.
 - **Comparative benchmark note**: The comparative Waggle-vs-RAG corpus is still evolving. For current per-family/token numbers, use the checked-in artifact index in [tests/artifacts/README.md](./tests/artifacts/README.md) rather than this top-level summary.
 
 Detailed benchmark artifacts and the new **[Benchmark Methodology](./docs/benchmark-methodology.md)** guide provide full traceability.
+
+---
+
+## Known Limitations
+
+- **Best on structured recall, weaker on benchmark-style answer synthesis**: Waggle is strongest when the problem is "retrieve the right facts and relationships" rather than "emit one benchmark-formatted final answer from memory."
+- **Edges matter**: Isolated `store_node` writes do not create graph context by themselves. Connected context comes from `store_edge`, `observe_conversation`, `decompose_and_store`, and automatic contradiction/update detection.
+- **Graph retrieval is not always the cheapest mode**: factual lookups are often much cheaper than chunked RAG, but graph-expansion queries intentionally use more tokens to carry reasoning context.
+- **Deduplication is conservative by design**: the system prefers missed merges over unsafe merges, which protects correctness but leaves some semantically similar duplicates unmerged.
+- **README numbers are intentionally narrow**: only the most stable benchmark claims are summarized here; per-family and evolving comparative numbers live in the artifact docs instead.
+
+For operational details, scaling considerations, tool-level behavior, and the full MCP feature surface, see [docs/reference.md](./docs/reference.md).
 
 ---
 
