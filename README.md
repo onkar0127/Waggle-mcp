@@ -98,18 +98,18 @@ Waggle performance is verified against checked-in fixtures and automated regress
 |------|--------|--------|
 | Extraction | 25-case deterministic fixture | `100.0%` |
 | Retrieval | 18-query retrieval fixture | `83.3% Hit@k` |
-| Comparative eval | 27-scenario / 69-query corpus | `88.4% Hit@k`, `76.8% exact support`, `58.5` mean tokens |
+| Comparative eval | 27-scenario / 69-query corpus | `88.4% Hit@k`, `76.8% exact support`, `58.5` tokens/query |
 | Query stress | 40 adversarial retrieval-only cases | `97.5% Hit@k`, `97.5% exact support` |
 | Deduplication | 22 cases (semi-semantic) | `77.3% (17/22)`, zero false merges |
 | Unit Tests | Infrastructure & Logic | `90+ passing tests` |
 
 ### External Benchmarks
-| Benchmark | Coverage | Metric | Command |
-|-----------|----------|--------|---------|
-| **LongMemEval** | 500 questions | `97.4% R@5` | `scripts/benchmark_longmemeval.py` |
-| **LoCoMo** | 1,986 items | `Pending` | `scripts/benchmark_locomo.py` |
-| **ConvoMem** | 250 items | `Pending` | `scripts/benchmark_convomem.py` |
-| **MemBench** | 8,500 items | `Pending` | `scripts/benchmark_membench.py` |
+| Benchmark | Coverage | Metric | Status |
+|-----------|----------|--------|--------|
+| **LongMemEval** | 500 questions | `97.4% R@5` | Verified (Held-out split: 81.6% deterministic) |
+| **LoCoMo** | 1,986 items | `Pending` | Adapter implemented |
+| **ConvoMem** | 250 items | `Pending` | Adapter implemented |
+| **MemBench** | 8,500 items | `Pending` | Adapter implemented |
 
 - **Token efficiency**: Waggle averages `58.5` tokens per retrieval vs `150.9` for naive chunked RAG.
 - **Retrieval split**: The flat slice (`factual_recall`, `temporal_*`) measures `85% / 85%`; the graph slice (`change`, `delta`, `synthesis`, paraphrase) measures `93% / 70%`.
