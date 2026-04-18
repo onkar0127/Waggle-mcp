@@ -15,5 +15,6 @@ CODEX.md
 bmsce-date/
 scripts/benchmark_results.json
 benchmarks/output/
+benchmarks/longmemeval/.cache/
 *.egg-info/
 benchmarks/longmemeval/longmemeval_s_cleaned.json

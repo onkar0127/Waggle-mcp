@@ -170,6 +170,89 @@ def build_context_bundle(
     )
 
 
+def _shorten_summary_text(text: str, *, max_chars: int = 160) -> str:
+    normalized = " ".join(text.strip().split())
+    if len(normalized) <= max_chars:
+        return normalized
+    clipped = normalized[: max_chars - 1].rstrip(" ,;:-")
+    return f"{clipped}…"
+
+
+def _support_labels_for_node(node: Node, edges: list[Edge], node_by_id: dict[str, Node]) -> list[str]:
+    labels: list[str] = []
+    for edge in edges:
+        if edge.relationship not in {"depends_on", "derived_from", "part_of", "relates_to"}:
+            continue
+        if edge.source_id == node.id and edge.target_id in node_by_id:
+            labels.append(node_by_id[edge.target_id].label)
+        elif edge.target_id == node.id and edge.source_id in node_by_id:
+            labels.append(node_by_id[edge.source_id].label)
+    return list(dict.fromkeys(labels))
+
+
+def build_query_summary(
+    *,
+    query: str,
+    nodes: list[Node],
+    edges: list[Edge],
+    replay_hits: list[ReplayHit],
+    retrieval_mode: str,
+) -> str:
+    if not nodes:
+        if replay_hits:
+            snippets = "; ".join(
+                _shorten_summary_text(hit.transcript_snippet or hit.transcript_text, max_chars=100)
+                for hit in replay_hits[:2]
+            )
+            return f"For '{query}', no structured nodes matched. Top replay evidence: {snippets}."
+        return f"No memory matched '{query}'."
+
+    node_by_id = {node.id: node for node in nodes}
+    parts: list[str] = []
+
+    fact_like_nodes = [
+        node for node in nodes if node.node_type.value in {"fact", "preference", "concept", "entity"}
+    ]
+    if fact_like_nodes:
+        parts.append(
+            "Key context: "
+            + "; ".join(_shorten_summary_text(node.content) for node in fact_like_nodes[:2])
+            + "."
+        )
+
+    decision_nodes = [node for node in nodes if node.node_type.value == "decision"]
+    if decision_nodes:
+        decision_summaries: list[str] = []
+        for node in decision_nodes[:2]:
+            support_labels = _support_labels_for_node(node, edges, node_by_id)
+            primary_text = _shorten_summary_text(node.content, max_chars=120)
+            if support_labels:
+                decision_summaries.append(
+                    f"{primary_text} Supported by {', '.join(support_labels[:2])}"
+                )
+            else:
+                decision_summaries.append(primary_text)
+        parts.append("Decisions: " + "; ".join(decision_summaries) + ".")
+
+    note_nodes = [node for node in nodes if node.node_type.value == "note"]
+    if note_nodes:
+        parts.append("Open items: " + "; ".join(node.label for node in note_nodes[:2]) + ".")
+
+    contradiction_count = sum(1 for edge in edges if edge.relationship == "contradicts")
+    update_count = sum(1 for edge in edges if edge.relationship == "updates")
+    if contradiction_count:
+        parts.append(f"{contradiction_count} contradiction edge{'s' if contradiction_count != 1 else ''} included.")
+    elif update_count:
+        parts.append(f"{update_count} update edge{'s' if update_count != 1 else ''} included.")
+
+    if replay_hits and retrieval_mode in {"replay", "fusion"}:
+        parts.append(f"{len(replay_hits)} replay hit{'s' if len(replay_hits) != 1 else ''} included for provenance.")
+
+    if not parts:
+        return f"Query context for '{query}' returned {len(nodes)} nodes."
+    return " ".join(parts)
+
+
 def _render_instruction_note(bundle: ContextBundle) -> str:
     if bundle.audience == "human":
         return (

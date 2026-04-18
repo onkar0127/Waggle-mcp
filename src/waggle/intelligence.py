@@ -54,6 +54,11 @@ _GO_TO_PREFERENCE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_META_CONFLICT_HINT_RE = re.compile(
+    r"\b(?:policy|methodology|benchmark|documentation|docs|guide|workflow|runbook|handoff|summary limitation|dogfood)\b",
+    re.IGNORECASE,
+)
+_EXAMPLE_MARKER_RE = re.compile(r"\b(?:such as|for example|example|e\.g\.)\b", re.IGNORECASE)
 _DECISION_RE = re.compile(
     r"\b(?:let's use|lets use|we should use|go with|stay with|stick with|we are using|we're using|"
     r"i am using|i'm using|im using|"
@@ -666,6 +671,8 @@ def detect_conflict_reason(existing: Node, incoming: Node) -> str | None:
         return None
     if existing.node_type != incoming.node_type:
         return None
+    if _is_meta_conflict_candidate(existing) or _is_meta_conflict_candidate(incoming):
+        return None
 
     incoming_focus = extract_focus_tokens(incoming.content)
     existing_focus = extract_focus_tokens(existing.content)
@@ -691,6 +698,20 @@ def detect_conflict_reason(existing: Node, incoming: Node) -> str | None:
     if incoming_context & existing_context and len(incoming_focus | existing_focus) <= 4:
         return "Potentially conflicting choice in the same context"
     return None
+
+
+def _is_meta_conflict_candidate(node: Node) -> bool:
+    normalized_tags = {normalize_text(tag) for tag in node.tags}
+    if normalized_tags & {"docs", "documentation", "evaluation", "ux", "next-step", "handoff"}:
+        return True
+
+    combined = f"{node.label} {node.content}"
+    if not _META_CONFLICT_HINT_RE.search(combined):
+        return False
+
+    if "policy" in normalize_text(combined) and _EXAMPLE_MARKER_RE.search(combined):
+        return True
+    return bool(_META_CONFLICT_HINT_RE.search(combined) and normalized_tags & {"policy", "docs"})
 
 
 def summarize_topic(nodes: list[Node]) -> tuple[str, list[str]]:

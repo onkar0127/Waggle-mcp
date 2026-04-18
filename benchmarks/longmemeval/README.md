@@ -45,13 +45,14 @@ Measured locally on the full `500`-question `s` split:
 
 | Mode | R@5 | Exact@5 |
 |------|-----|---------|
-| `graph_raw` | `97.0%` | `76.4%` |
-| `graph_hybrid` | `95.8%` | `82.0%` |
+| `graph_raw` | `97.4%` | `88.2%` |
+| `graph_hybrid` | `96.4%` | `85.6%` |
 
 Raw output artifact:
 
 - [`results_graph_raw.json`](./results_graph_raw.json)
 - [`results_graph_hybrid.json`](./results_graph_hybrid.json)
+- Methodology note: [docs/longmemeval-methodology.md](../../docs/longmemeval-methodology.md)
 
 ## Notes
 
@@ -59,3 +60,4 @@ Raw output artifact:
 - By default cache files are written to `benchmarks/longmemeval/.cache/`; warm reruns reuse the prepared-session cache and skip re-embedding the same split.
 - `graph_raw` is the fairest current comparison to raw retrieval systems because it does not add reranking.
 - `graph_hybrid` now uses the same prepared-session cache and the full 500-case artifact is saved, but it should still be treated as exploratory rather than a fast CI benchmark.
+- The current saved artifacts were generated from cold-cache runs and now include `cache_status`, `cache_path`, `cache_key`, and prepared-entry counts.

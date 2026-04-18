@@ -287,6 +287,8 @@ def test_export_context_bundle_query_writes_markdown_and_json(tmp_path: Path) ->
     assert payload["export_type"] == "context_bundle"
     assert payload["mode"] == "query"
     assert payload["query"] == "what database did we decide on"
+    assert "We decided to use PostgreSQL for production." in payload["summary"]
+    assert "MySQL replication pain" in payload["summary"]
     assert payload["nodes"]
     assert payload["edges"]
     assert payload["render_hints"]["token_estimate"] > 0
@@ -513,6 +515,26 @@ def test_conflict_detection_creates_contradiction_edge(tmp_path: Path) -> None:
     related = graph.get_related(node_id=second.node.id, max_depth=1)
     assert any(edge.relationship == RelationType.CONTRADICTS for edge in related.edges)
     assert first.node.id in {node.id for node in related.nodes}
+
+
+def test_conflict_detection_skips_meta_policy_example_nodes(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    first = graph.add_node(
+        label="Hedged statements policy",
+        content='Hedged or conditional turns such as "I think we should probably go with Redis" are stored as note nodes instead of hard decisions.',
+        node_type=NodeType.DECISION,
+        tags=["extraction", "policy"],
+    )
+    second = graph.add_node(
+        label="Negated tool choice policy",
+        content='Negated statements such as "We are not using MongoDB anymore" are stored as decision nodes with negated tags so the graph preserves polarity.',
+        node_type=NodeType.DECISION,
+        tags=["extraction", "policy"],
+    )
+
+    assert second.conflicts == []
+    related = graph.get_related(node_id=second.node.id, max_depth=1)
+    assert not any(edge.relationship == RelationType.CONTRADICTS for edge in related.edges)
 
 
 def test_load_graph_preserves_edge_attributes(tmp_path: Path) -> None:

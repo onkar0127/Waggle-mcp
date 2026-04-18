@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 import statistics
 import tempfile
@@ -15,7 +16,7 @@ from typing import Any, Literal
 from waggle.embeddings import EmbeddingModel
 from waggle.graph import MemoryGraph
 from waggle.intelligence import extract_conversation_candidates, infer_temporal_hints
-from waggle.models import NodeType
+from waggle.models import NodeType, RelationType
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIXTURES_DIR = ROOT / "benchmarks" / "fixtures"
@@ -48,6 +49,8 @@ class ComparativeCaseResult:
     retrieved_ids: list[str]
     gold_support_ids: list[str]
     failure_label: str = ""
+    retrieval_mode: str = ""
+    max_depth: int = 0
 
 
 @dataclass
@@ -78,6 +81,22 @@ class RagChunk:
     text: str
     timestamp: str
     support_fact_ids: list[str]
+
+
+COMPARATIVE_TASK_QUERY_POLICY: dict[str, dict[str, Any]] = {
+    "factual_recall": {"retrieval_mode": "flat", "max_depth": 0},
+    "temporal_latest": {"retrieval_mode": "flat", "max_depth": 0},
+    "temporal_original": {"retrieval_mode": "flat", "max_depth": 0},
+    "multi_session_change": {"retrieval_mode": "graph", "max_depth": 2},
+    "cross_scenario_synthesis": {"retrieval_mode": "graph", "max_depth": 2},
+    "decision_delta": {"retrieval_mode": "graph", "max_depth": 2},
+    "adversarial_paraphrase": {"retrieval_mode": "graph", "max_depth": 1},
+}
+
+COMPARATIVE_TRANSCRIPT_RE = re.compile(
+    r"^\s*User:\s*(?P<user>.*?)\s*(?:Agent|Assistant):\s*(?P<assistant>.*?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def load_benchmark_fixtures(fixtures_dir: Path | str = DEFAULT_FIXTURES_DIR) -> dict[str, Any]:
@@ -158,6 +177,32 @@ def _estimate_tokens(text: str) -> int:
     return max(1, math.ceil(len(normalized) / 4))
 
 
+def _comparative_query_config(task_family: str) -> dict[str, Any]:
+    return dict(COMPARATIVE_TASK_QUERY_POLICY.get(task_family, {"retrieval_mode": "flat", "max_depth": 0}))
+
+
+def _policy_summary() -> dict[str, Any]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for task_family, config in COMPARATIVE_TASK_QUERY_POLICY.items():
+        entry = grouped.setdefault(
+            str(config["retrieval_mode"]),
+            {"task_families": [], "max_depths": []},
+        )
+        entry["task_families"].append(task_family)
+        entry["max_depths"].append(int(config["max_depth"]))
+    for entry in grouped.values():
+        entry["task_families"].sort()
+        entry["max_depths"] = sorted(set(entry["max_depths"]))
+    return grouped
+
+
+def _parse_comparative_transcript(transcript: str) -> tuple[str, str]:
+    match = COMPARATIVE_TRANSCRIPT_RE.match(transcript.strip())
+    if match is None:
+        raise BenchmarkRuntimeError(f"Comparative fixture transcript is malformed: {transcript!r}")
+    return match.group("user").strip(), match.group("assistant").strip()
+
+
 def _percentile(values: list[int], quantile: float) -> float:
     if not values:
         return 0.0
@@ -182,10 +227,10 @@ def _set_node_timestamp(graph: MemoryGraph, node_id: str, timestamp: str) -> Non
         connection.execute(
             """
             UPDATE nodes
-            SET created_at = ?, updated_at = ?
+            SET valid_from = COALESCE(valid_from, ?), created_at = ?, updated_at = ?
             WHERE id = ? AND tenant_id = ?
             """,
-            (timestamp, timestamp, node_id, graph.tenant_id),
+            (timestamp, timestamp, timestamp, node_id, graph.tenant_id),
         )
 
 
@@ -194,6 +239,18 @@ def _extract_fact_id(tags: list[str]) -> str | None:
         if tag.startswith("fact_id:"):
             return tag.split(":", 1)[1]
     return None
+
+
+def _set_session_timestamp(graph: MemoryGraph, session_id: str, timestamp: str) -> None:
+    with graph._lock, graph._connect() as connection:  # noqa: SLF001 - benchmark helper
+        connection.execute(
+            """
+            UPDATE transcript_records
+            SET observed_at = ?
+            WHERE tenant_id = ? AND session_id = ?
+            """,
+            (timestamp, graph.tenant_id, session_id),
+        )
 
 
 def run_extraction_benchmark(
@@ -457,7 +514,19 @@ def _aggregate_case_results(results: list[ComparativeCaseResult]) -> dict[str, A
             "exact_support": sum(1 if result.exact_support else 0 for result in failure_results) / len(failure_results),
         }
 
-    return {
+    retrieval_modes = sorted({result.retrieval_mode for result in results if result.retrieval_mode})
+    by_retrieval_mode: dict[str, dict[str, Any]] = {}
+    for retrieval_mode in retrieval_modes:
+        mode_results = [result for result in results if result.retrieval_mode == retrieval_mode]
+        by_retrieval_mode[retrieval_mode] = {
+            "case_count": len(mode_results),
+            "hit_at_k": sum(1 if result.hit_at_k else 0 for result in mode_results) / len(mode_results),
+            "exact_support": sum(1 if result.exact_support else 0 for result in mode_results) / len(mode_results),
+            "max_depths": sorted({result.max_depth for result in mode_results}),
+            "task_families": sorted({result.task_family for result in mode_results}),
+        }
+
+    summary = {
         "case_count": len(results),
         "hit_at_k": sum(hit_scores) / len(hit_scores) if hit_scores else 0.0,
         "exact_support": sum(exact_scores) / len(exact_scores) if exact_scores else 0.0,
@@ -469,6 +538,9 @@ def _aggregate_case_results(results: list[ComparativeCaseResult]) -> dict[str, A
         "by_task_family": by_family,
         "by_failure_label": by_failure_label,
     }
+    if by_retrieval_mode:
+        summary["by_retrieval_mode"] = by_retrieval_mode
+    return summary
 
 
 def _build_comparative_graph(
@@ -484,8 +556,76 @@ def _build_comparative_graph(
                 content=fact["content"],
                 node_type=NodeType(fact["node_type"]),
                 tags=["benchmark", f"fact_id:{fact['id']}", f"scenario:{scenario['id']}"],
+                project="comparative-benchmark",
             )
             _set_node_timestamp(graph, result.node.id, fact["timestamp"])
+    return graph
+
+
+def _build_comparative_graph_with_sessions(
+    comparative_eval: dict[str, Any],
+    *,
+    embedding_model: Any,
+) -> MemoryGraph:
+    graph = _graph(embedding_model)
+    fact_node_ids: dict[str, str] = {}
+
+    for scenario in comparative_eval["scenarios"]:
+        ordered_facts = sorted(scenario["facts"], key=lambda item: item["timestamp"])
+        for fact in ordered_facts:
+            result = graph.add_node(
+                label=fact["label"],
+                content=fact["content"],
+                node_type=NodeType(fact["node_type"]),
+                tags=["benchmark", f"fact_id:{fact['id']}", f"scenario:{scenario['id']}"],
+                project="comparative-benchmark",
+            )
+            fact_node_ids[fact["id"]] = result.node.id
+            _set_node_timestamp(graph, result.node.id, fact["timestamp"])
+
+        for older, newer in zip(ordered_facts, ordered_facts[1:], strict=False):
+            older_node_id = fact_node_ids[older["id"]]
+            newer_node_id = fact_node_ids[newer["id"]]
+            if older_node_id == newer_node_id:
+                continue
+            graph.add_edge(
+                source_id=newer_node_id,
+                target_id=older_node_id,
+                relationship=RelationType.UPDATES,
+                metadata={"origin": "comparative-temporal", "scenario": scenario["id"]},
+            )
+            graph.add_edge(
+                source_id=newer_node_id,
+                target_id=older_node_id,
+                relationship=RelationType.CONTRADICTS,
+                metadata={"origin": "comparative-temporal", "scenario": scenario["id"], "kind": "superseded-state"},
+            )
+
+        for session in scenario["sessions"]:
+            user_message, assistant_response = _parse_comparative_transcript(session["transcript"])
+            observation = graph.observe_conversation(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                project="comparative-benchmark",
+                session_id=session["id"],
+            )
+            _set_session_timestamp(graph, session["id"], session["timestamp"])
+            for stored_node in observation.stored_nodes:
+                _set_node_timestamp(graph, stored_node.id, session["timestamp"])
+            for fact_id in session.get("support_fact_ids", []):
+                target_id = fact_node_ids.get(fact_id)
+                if target_id is None:
+                    continue
+                for stored_node in observation.stored_nodes:
+                    if target_id == stored_node.id:
+                        continue
+                    graph.add_edge(
+                        source_id=target_id,
+                        target_id=stored_node.id,
+                        relationship=RelationType.DEPENDS_ON,
+                        metadata={"origin": "comparative-support", "session_id": session["id"]},
+                    )
+
     return graph
 
 
@@ -495,11 +635,16 @@ def _run_waggle_system(
     embedding_model: Any,
     top_k: int,
 ) -> tuple[dict[str, Any], list[ComparativeCaseResult]]:
-    graph = _build_comparative_graph(comparative_eval, embedding_model=embedding_model)
+    graph = _build_comparative_graph_with_sessions(comparative_eval, embedding_model=embedding_model)
 
     results: list[ComparativeCaseResult] = []
     for case in comparative_eval["queries"]:
-        subgraph = graph.query(query=case["query"], max_nodes=top_k, max_depth=0)
+        query_config = _comparative_query_config(case["task_family"])
+        subgraph = graph.query(
+            query=case["query"],
+            max_nodes=top_k,
+            max_depth=int(query_config["max_depth"]),
+        )
         retrieved_fact_ids = [
             fact_id
             for node in subgraph.nodes
@@ -520,10 +665,16 @@ def _run_waggle_system(
                 context_tokens=_estimate_tokens(context_text),
                 retrieved_ids=retrieved_fact_ids,
                 gold_support_ids=list(case["gold_support_ids"]),
+                retrieval_mode=str(query_config["retrieval_mode"]),
+                max_depth=int(query_config["max_depth"]),
             )
         )
 
-    return {"system": "waggle", "parameters": {"top_k": top_k}}, results
+    return {
+        "system": "waggle",
+        "parameters": {"top_k": top_k, "task_family_max_depth": {key: value["max_depth"] for key, value in COMPARATIVE_TASK_QUERY_POLICY.items()}},
+        "query_policy": _policy_summary(),
+    }, results
 
 
 def _run_rag_system(
@@ -595,6 +746,8 @@ def run_comparative_evaluation(
 
             summary = _aggregate_case_results(results)
             summary["parameters"] = info["parameters"]
+            if "query_policy" in info:
+                summary["query_policy"] = info["query_policy"]
             system_summaries[system] = summary
             all_case_results.extend(asdict(result) for result in results)
 
@@ -729,6 +882,29 @@ def build_markdown_summary(report: BenchmarkReport) -> str:
             f"{metrics['context_tokens']['mean']:.1f} | {metrics['context_tokens']['median']:.1f} | "
             f"{metrics['context_tokens']['p95']:.1f} |"
         )
+    waggle_metrics = report.comparative["systems"].get("waggle", {})
+    if waggle_metrics.get("query_policy"):
+        lines.extend(["", "## Waggle Query Policy", ""])
+        for mode, details in waggle_metrics["query_policy"].items():
+            lines.append(
+                f"- `{mode}`: max_depth={','.join(str(value) for value in details['max_depths'])}; "
+                f"families={', '.join(details['task_families'])}"
+            )
+    if waggle_metrics.get("by_retrieval_mode"):
+        lines.extend(
+            [
+                "",
+                "## Waggle Mode Breakdown",
+                "",
+                "| Mode | Cases | Max depth | Hit@k | Exact support |",
+                "|------|-------|-----------|-------|---------------|",
+            ]
+        )
+        for mode, metrics in waggle_metrics["by_retrieval_mode"].items():
+            lines.append(
+                f"| {mode} | {metrics['case_count']} | {', '.join(str(value) for value in metrics['max_depths'])} | "
+                f"{metrics['hit_at_k']:.0%} | {metrics['exact_support']:.0%} |"
+            )
     lines.extend(
         [
             "",

@@ -15,6 +15,8 @@ This directory contains the saved outputs from the waggle-mcp benchmark harness.
 
 Regenerate it at any time to update results against the current fixture set. The companion `benchmark_current.md` is written alongside it automatically.
 
+For a dated, auditable snapshot of the exact command outputs used to verify current README benchmark claims, see [verification/2026-04-18-readme-claims/README.md](/Users/abhigyanshekhar/Desktop/MCP/tests/artifacts/verification/2026-04-18-readme-claims/README.md).
+
 ---
 
 ## Fixture inventory
@@ -25,6 +27,9 @@ Regenerate it at any time to update results against the current fixture set. The
 | `benchmarks/fixtures/retrieval_cases.json` | 18 nodes + 18 queries (6 easy, 12 adversarial) |
 | `benchmarks/fixtures/dedup_cases.json` | 22 node pairs (11 true-dup, 11 false-friend) |
 | `benchmarks/fixtures/comparative_eval.json` | 27 multi-session scenarios, 66 retrieval queries |
+| `tests/artifacts/verification/2026-04-18-readme-claims/README.md` | Dated verification snapshot for README benchmark claims |
+| `tests/artifacts/context_handoff_dogfood.md` | Example query-mode handoff bundle for the Waggle project |
+| `tests/artifacts/context_handoff_dogfood.json` | Machine-readable version of the same handoff bundle |
 
 ---
 
@@ -48,26 +53,40 @@ Corpus: 18 nodes, 18 queries — 6 easy, 12 adversarial.
 | Adversarial | 12 | 75% |
 | **Overall** | **18** | **83%** |
 
-### Comparative pilot (Waggle vs RAG)
+### Comparative graph eval (Waggle vs RAG)
 
 Corpus: 27 multi-session scenarios, 66 retrieval queries across 7 task families.
 
+Methodology note: the comparative run now ingests fixture sessions through Waggle's observation path, adds explicit support/update/contradiction edges from the corpus, and uses a mixed query policy. Flat retrieval (`max_depth=0`) is used for factual and temporal prompts; graph traversal (`max_depth=1..2`) is used for change-tracking, synthesis, delta, and paraphrase prompts.
+
+Token framing note: the old "~4x fewer tokens" line no longer applies to the blended comparative mean. The current saved run is about `2.7x` lower-token overall (`56.3` vs `150.2`). The stronger `~4x` framing is still directionally true for the simpler flat-retrieval slice, but graph-mode queries intentionally spend more context to carry reasoning chains.
+
 | System | Mean tokens | Median | p95 | Hit@k | Exact support |
 |--------|-------------|--------|-----|-------|---------------|
-| **waggle** | **37.7** | **38.0** | **45.0** | 88% | 73% |
+| **waggle** | **56.3** | **42.0** | **109.0** | 88% | 79% |
 | rag_naive | 150.2 | 149.0 | 161.0 | 100% | 98% |
+| rag_tuned | 242.7 | 242.5 | 259.8 | 100% | 100% |
+
+#### Waggle mode breakdown
+
+| Mode | Cases | Max depth | Hit@k | Exact support |
+|------|-------|-----------|-------|---------------|
+| flat | 39 | 0 | 85% | 85% |
+| graph | 27 | 1, 2 | 93% | 70% |
+
+Interpretation note: the graph slice has better Hit@k than the flat slice, but lower exact support. In practice that often means Waggle found the gold node and bundled extra typed context around it. Treat graph-mode exact-support misses as "inspect bundle quality" rather than automatically as retrieval failure.
 
 #### Per-family breakdown
 
 | Task family | n | Waggle hit@k | RAG hit@k | Notes |
 |-------------|---|-------------|----------|-------|
-| `factual_recall` | 18 | 100% | 100% | Both systems equal |
-| `temporal_original` | 19 | 89% | 100% | Waggle misses ~2 earliest facts |
-| `multi_session_change` | 11 | 91% | 100% | Waggle occasionally misses one session |
-| `cross_scenario_synthesis` | 8 | 88% | 100% | Waggle still misses one synthesis case and exact support remains low |
-| `decision_delta` | 4 | 100% | 100% | Both find before+after |
-| `adversarial_paraphrase` | 4 | 25% | 100% | **Waggle gap**: indirect queries still underperform badly on this corpus |
-| `temporal_latest` | 2 | 50% | 100% | Small sample; Waggle uncertain on recency |
+| `factual_recall` | 18 | 89% | 100% | Flat retrieval still trails RAG, but the graph-ingested build recovers most simple recalls |
+| `temporal_original` | 19 | 89% | 100% | Original-state ranking still drops a few earliest facts |
+| `multi_session_change` | 11 | 100% | 100% | Graph traversal now recovers every before/after pair in this slice |
+| `cross_scenario_synthesis` | 8 | 88% | 100% | Hit@k is solid, but exact support stays low on multi-fact synthesis; still a known limitation for loosely linked scenarios |
+| `decision_delta` | 4 | 100% | 100% | Graph traversal reliably recovers before+after pairs |
+| `adversarial_paraphrase` | 4 | 75% | 100% | Graph traversal materially improves indirect change queries, but one paraphrase case still misses |
+| `temporal_latest` | 2 | 0% | 100% | Small sample, but both latest queries currently miss in Waggle |
 
 ### Deduplication
 

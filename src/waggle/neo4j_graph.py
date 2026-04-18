@@ -12,7 +12,7 @@ import networkx as nx
 import numpy as np
 
 from waggle.auth import generate_api_key, hash_api_key, verify_api_key
-from waggle.context_bundle import build_context_bundle, export_context_bundle_files
+from waggle.context_bundle import build_context_bundle, build_query_summary, export_context_bundle_files
 from waggle.evidence import build_observation_evidence, merge_evidence_records, merge_validity_windows
 from waggle.errors import AuthenticationError, ValidationFailure
 from waggle.intelligence import (
@@ -1245,8 +1245,12 @@ class Neo4jMemoryGraph:
             selected_nodes = selected.nodes
             selected_edges = selected.edges if include_edges else []
             replay_hits = selected.replay_hits
-            summary = (
-                f"Query context for '{query}' with {len(selected.nodes)} nodes and {len(selected.edges) if include_edges else 0} edges."
+            summary = build_query_summary(
+                query=query,
+                nodes=selected_nodes,
+                edges=selected_edges,
+                replay_hits=replay_hits,
+                retrieval_mode=normalized_retrieval_mode,
             )
         else:
             with self._lock, self._session() as session:

@@ -65,10 +65,10 @@ This is distinct from the existing Jaccard-boosted path (which requires jaccard 
 
 ## Phase 2 — Context Assembly Depth
 
-**Current state:** 91% Hit@k, 74% exact support. Worst case: `cross_scenario_synthesis` — 8/8 hit, 1/8 exact.  
-Waggle finds the right topic but doesn't assemble enough surrounding context.
+**Current state:** 93% Hit@k, 70% exact support on graph-routed queries in the comparative corpus. Worst case remains `cross_scenario_synthesis` — hit rate is high, but exact support stays low because loosely linked scenarios are still hard to bundle cleanly.  
+Waggle now finds the right topic much more reliably in graph mode; the remaining work is improving bundle precision without losing the relational context that makes graph retrieval useful.
 
-**Target:** Exact support ≥85% on current 66-query corpus; mean tokens stay under 55 (preserving ≥2.5× advantage over RAG).
+**Target:** Improve graph-mode exact support without collapsing graph-mode Hit@k, and keep blended comparative mean tokens well below naive RAG.
 
 ### Step 2A — Diagnose the failure pattern first
 
@@ -100,7 +100,7 @@ query_graph("database decision")
 - Deduplicate expanded results
 - Cap total returned nodes at `top_k * 2`
 
-**Hard constraint:** If expansion pushes mean tokens above 60, the 4× claim erodes to ~2.5×. That's still defensible but the README table must be updated honestly.
+**Hard constraint:** If expansion pushes mean tokens materially upward, the efficiency claim must be reframed honestly. The current blended benchmark is already closer to ~2.7× than ~4×, so further context expansion has to justify its token cost.
 
 ### Step 2C — Selective expansion based on query type
 

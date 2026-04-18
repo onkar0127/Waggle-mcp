@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+
 import numpy as np
 
 from waggle.benchmark_harness import (
+    _build_comparative_graph_with_sessions,
     build_markdown_summary,
     choose_best_dedup_threshold,
     load_benchmark_fixtures,
@@ -76,6 +80,8 @@ def test_benchmark_report_includes_backend_labels_and_case_counts() -> None:
     assert set(report.stress_eval["systems"]) == {"graph_raw", "graph_hybrid"}
     assert set(report.comparative["systems"]) == {"waggle", "rag_naive", "rag_tuned"}
     assert len(report.comparative["per_case"]) == 198
+    assert set(report.comparative["systems"]["waggle"]["by_retrieval_mode"]) == {"flat", "graph"}
+    assert set(report.comparative["systems"]["waggle"]["query_policy"]) == {"flat", "graph"}
 
 
 def test_markdown_summary_includes_comparative_systems() -> None:
@@ -90,8 +96,47 @@ def test_markdown_summary_includes_comparative_systems() -> None:
     assert "# Waggle Comparative Evaluation" in markdown
     assert "| waggle |" in markdown
     assert "| rag_naive |" in markdown
+    assert "## Waggle Query Policy" in markdown
+    assert "## Waggle Mode Breakdown" in markdown
     assert "Failure Protocol" in markdown
     assert "## Query Stress Eval" in markdown
+
+
+def test_comparative_graph_builder_ingests_sessions_and_temporal_edges() -> None:
+    fixtures = load_benchmark_fixtures()
+
+    graph = _build_comparative_graph_with_sessions(fixtures["comparative_eval"], embedding_model=FakeEmbeddingModel())
+    with sqlite3.connect(graph.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        transcript_count = int(connection.execute("SELECT COUNT(*) FROM transcript_records").fetchone()[0])
+        assert transcript_count > 0
+
+        rows = connection.execute(
+            "SELECT id, tags FROM nodes WHERE tags LIKE ? OR tags LIKE ?",
+            ("%fact_id:db_sqlite_local%", "%fact_id:db_postgres_prod%"),
+        ).fetchall()
+
+        node_ids_by_fact: dict[str, str] = {}
+        for row in rows:
+            tags = json.loads(row["tags"])
+            for tag in tags:
+                if tag.startswith("fact_id:"):
+                    node_ids_by_fact[tag.split(":", 1)[1]] = row["id"]
+
+        older_id = node_ids_by_fact["db_sqlite_local"]
+        newer_id = node_ids_by_fact["db_postgres_prod"]
+        edge_rows = connection.execute(
+            """
+            SELECT relationship
+            FROM edges
+            WHERE source_id = ? AND target_id = ?
+            ORDER BY relationship
+            """,
+            (newer_id, older_id),
+        ).fetchall()
+        relationships = {row["relationship"] for row in edge_rows}
+        assert "updates" in relationships
+        assert "contradicts" in relationships
 def test_benchmark_report_runs_regex_only_extraction() -> None:
     report = run_benchmarks(extraction_backend="regex", embedding_model=FakeEmbeddingModel())
 

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Persistent, structured memory for AI agents — 4× fewer tokens than chunk-based retrieval.</strong><br/>
+  <strong>Persistent, structured memory for AI agents — up to 4× fewer tokens than chunk-based retrieval.</strong><br/>
   Your LLM remembers facts, decisions, and context <em>across every conversation</em>, backed by a real knowledge graph.
 </p>
 
@@ -37,7 +37,7 @@ Waggle gives your AI a persistent knowledge graph it can read and write through 
 | Flat notes and chunks | Typed nodes and edges: decisions, reasons, contradictions, updates |
 | "What changed?" requires replaying logs | Temporal queries and diffs are first-class |
 
-Waggle's core tradeoff is deliberate: it stores structured knowledge instead of replaying entire transcripts. On Waggle's checked-in 27-scenario multi-session corpus, that yields **~4× fewer tokens per retrieval** than naive chunked retrieval. The benchmark section below shows the actual numbers and limits.
+Waggle's core tradeoff is deliberate: it stores structured knowledge instead of replaying entire transcripts. On Waggle's checked-in 27-scenario multi-session corpus, that yields **up to ~4× fewer tokens on simple retrieval queries** and **~2.7× fewer tokens overall** than naive chunked retrieval. Graph-traversal queries spend more tokens because they include reasoning context such as updates, contradictions, and dependencies. The benchmark section below shows the actual numbers and limits.
 
 ---
 
@@ -202,20 +202,26 @@ Benchmark summary:
 |------|--------|--------|
 | Extraction | 25-case deterministic fixture | `100%` |
 | Retrieval | 18-query retrieval fixture | `83% Hit@k` |
-| Comparative efficiency | 27-scenario / 66-query corpus | `88% Hit@k`, `73% exact support`, `37.7` mean tokens |
+| Comparative graph eval | 27-scenario / 66-query corpus | `88% Hit@k`, `79% exact support`, `56.3` mean tokens |
 | Query stress | 40 adversarial retrieval-only cases | `98% Hit@k`, `98% exact support` |
-| External baseline | LongMemEval `s` split, 500 questions | `graph_raw: 97.0% R@5 / 76.4% Exact@5`, `graph_hybrid: 95.8% R@5 / 82.0% Exact@5` |
+| External baseline | LongMemEval `s` split, 500 questions | `graph_raw: 97.4% R@5 / 88.2% Exact@5`, `graph_hybrid: 96.4% R@5 / 85.6% Exact@5` |
 
 What these numbers mean:
-- Waggle is strongest when the query benefits from structured reasoning chains, temporal context, and contradiction tracking.
-- The `~4× fewer tokens` claim comes from the comparative corpus: Waggle averages `37.7` tokens per retrieval vs `150.2` for naive chunked-vector RAG.
-- The retrieval engine itself is strong in isolation (`98%` on the query-stress corpus). End-to-end misses still show up more in broader comparative evaluation than in retrieval-only tests.
+- The comparative benchmark now measures Waggle as a graph system: fixture sessions are ingested through transcript observation, support/update/contradiction edges are added, and Waggle switches between flat retrieval and graph traversal by task family.
+- Waggle's mixed-policy comparative run is `88% Hit@k / 79% exact` at `56.3` mean tokens. The flat slice (`factual_recall`, `temporal_*`) measures `85% / 85%`; the graph slice (`change`, `delta`, `synthesis`, paraphrase) measures `93% / 70%`.
+- The token-efficiency claim remains material even under the richer graph benchmark: Waggle averages `56.3` tokens per retrieval vs `150.2` for naive chunked-vector RAG.
+- The retrieval engine itself is still strong in isolation (`98%` on the query-stress corpus). The remaining comparative gap is now better interpreted as graph-ingested ranking quality, not just flat semantic lookup.
+- Lower graph-mode exact support does not always mean bad retrieval. In several graph cases, Waggle returns the gold node plus extra related context, so the strict support metric can undercount useful reasoning bundles.
+- `cross_scenario_synthesis` remains the clearest known limitation: retrieving across loosely related scenarios still underperforms, and that is better framed as a current product boundary than as a simple bug.
 - Deduplication is intentionally conservative: best measured `17/22 = 77%`, with **zero false merges** across the threshold sweep.
 
 Deep dives and saved artifacts:
 - Internal benchmark artifacts: [tests/artifacts/README.md](./tests/artifacts/README.md)
+- README claim verification snapshot: [tests/artifacts/verification/2026-04-18-readme-claims/README.md](./tests/artifacts/verification/2026-04-18-readme-claims/README.md)
 - LongMemEval artifacts: [benchmarks/longmemeval/README.md](./benchmarks/longmemeval/README.md)
+- LongMemEval methodology: [docs/longmemeval-methodology.md](./docs/longmemeval-methodology.md)
 - Evaluation roadmap: [docs/evaluation-plan.md](./docs/evaluation-plan.md)
+- Context handoff dogfood: [docs/context-handoff-dogfood.md](./docs/context-handoff-dogfood.md)
 
 ---
 
@@ -231,14 +237,20 @@ Detailed reference material lives outside the landing flow:
   [docs/runbooks/](./docs/runbooks/)
 - Benchmark artifacts and methodology:
   [tests/artifacts/README.md](./tests/artifacts/README.md)
+  and [tests/artifacts/verification/2026-04-18-readme-claims/README.md](./tests/artifacts/verification/2026-04-18-readme-claims/README.md)
   and [benchmarks/longmemeval/README.md](./benchmarks/longmemeval/README.md)
+- LongMemEval methodology note:
+  [docs/longmemeval-methodology.md](./docs/longmemeval-methodology.md)
+- Context handoff dogfood findings:
+  [docs/context-handoff-dogfood.md](./docs/context-handoff-dogfood.md)
 
 ---
 
 ## Next Steps
 
 - Expand the extraction corpus beyond the current 25 cases so robustness claims are based on larger paraphrase-, temporal-, multi-fact-, and adversarial-negation-heavy fixtures.
-- Publish a short LongMemEval methodology note, including cold vs warm cache runs and the reranked comparison path.
+- Improve flat ranking inside the graph-ingested comparative corpus, especially `temporal_latest`, `temporal_original`, and plain factual recall where the mixed benchmark is currently weakest.
+- Add a handoff evaluation fixture that checks whether exported context bundles let a second model answer continuation questions correctly.
 - Tighten replay/fusion ranking for recall-heavy workloads and improve provenance summaries in exported bundles.
 - Polish Neo4j query paths and large-vault import reporting.
 
