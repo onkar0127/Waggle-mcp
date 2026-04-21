@@ -41,7 +41,9 @@
 ## Who is this for?
 
 **→ Individual developer** extending Claude, Codex, Cursor, or Antigravity with persistent memory:
-`pip install waggle-mcp && waggle-mcp init` and you're done. SQLite + local embeddings, zero infra.
+Use Python 3.11+ and install via `pipx` (no venv activation needed):
+`brew install pipx && pipx ensurepath && pipx install waggle-mcp && waggle-mcp init`.
+SQLite + local embeddings, zero infra.
 
 **→ Team running a shared memory service:** Waggle ships with a Docker image, Kubernetes manifests, Prometheus metrics, and multi-tenant auth. See [deploy/kubernetes/](./deploy/kubernetes/) and [docs/runbooks/](./docs/runbooks/).
 
@@ -76,17 +78,25 @@ flowchart LR
 
 ---
 
-## Quick start
+## Quick start (Recommended)
+
+The simplest way to use Waggle is via `pipx`. This installs the package in an isolated environment and makes the `waggle-mcp` command available globally **without needing to manage a virtual environment (`.venv`) manually**.
 
 ```bash
-pip install waggle-mcp
-waggle-mcp init
-# Restart your MCP client. Done.
-```
+# 1. Install waggle globally
+pipx install waggle-mcp
 
-`init` detects your MCP client, writes its config, and creates the local database directory. Default mode is local SQLite with on-device embeddings. Antigravity and manual configuration details are in [docs/reference.md](./docs/reference.md).
+# 2. Run the interactive setup
+waggle-mcp init
+```
+*(If you don't have `pipx`, install it via `brew install pipx && pipx ensurepath`.)*
+
+Running `init` will detect your MCP client (Codex, Claude, Cursor, or Antigravity), write the necessary configuration, and initialize your local database. Restart your client, and you're ready to go.
 
 Manual MCP setup examples for **Codex**, **Claude Code**, **Cursor**, and **Antigravity** are in [docs/reference.md](./docs/reference.md#manual-client-configuration).
+
+Comprehensive live feature run (full tool surface, multi-query graph tests, export/import validation):
+[`tests/artifacts/test-run/comprehensive_feature_demo.md`](./tests/artifacts/test-run/comprehensive_feature_demo.md)
 
 > **⚠️ Edges are what make graph memory work.**
 > `observe_conversation` and `decompose_and_store` create edges automatically.
@@ -97,16 +107,16 @@ Manual MCP setup examples for **Codex**, **Claude Code**, **Cursor**, and **Anti
 
 ## Setting Up waggle as an MCP Server
 
-> **One-time install:** `pip install waggle-mcp` — no API key, no cloud account, no Docker required for local use.
+> **One-time install:** `pipx install waggle-mcp` (requires Python 3.11+; recommended on macOS/Homebrew Python) — no API key, no cloud account, no Docker required for local use.
 
-Use this shared JSON config shape for clients that accept `mcpServers` JSON:
+Use this shared JSON config shape for clients that accept `mcpServers` JSON (recommended when installed via `pipx`):
 
 ```json
 {
   "mcpServers": {
     "waggle": {
-      "command": "python",
-      "args": ["-m", "waggle.server"],
+      "command": "waggle-mcp",
+      "args": ["serve"],
       "env": {
         "WAGGLE_TRANSPORT": "stdio",
         "WAGGLE_BACKEND": "sqlite",
@@ -132,8 +142,8 @@ Use this shared JSON config shape for clients that accept `mcpServers` JSON:
 
 **Cursor**
 - `Cursor Settings -> Features -> MCP Servers -> + Add`
-- Command: `python`
-- Args: `-m waggle.server`
+- Command: `waggle-mcp`
+- Args: `serve`
 - Env vars: same keys as the JSON block above.
 
 **Claude Code**
@@ -144,7 +154,7 @@ claude mcp add waggle \
   --env WAGGLE_DB_PATH=~/.waggle/memory.db \
   --env WAGGLE_DEFAULT_TENANT_ID=local-default \
   --env WAGGLE_MODEL=all-MiniLM-L6-v2 \
-  -- python -m waggle.server
+  -- waggle-mcp serve
 ```
 
 </details>
@@ -155,8 +165,8 @@ Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.waggle]
-command = "python"
-args    = ["-m", "waggle.server"]
+command = "waggle-mcp"
+args    = ["serve"]
 env     = {
   WAGGLE_TRANSPORT         = "stdio",
   WAGGLE_BACKEND           = "sqlite",
@@ -166,9 +176,15 @@ env     = {
 }
 ```
 
-### `python` not on PATH?
+### `waggle-mcp` not on PATH?
 
-Replace `"command": "python"` with the full interpreter path:
+If you installed with `pipx`, ensure its bin path is available:
+
+```bash
+pipx ensurepath
+```
+
+Then restart your terminal/client. If you're using a venv-based install, use the venv interpreter path instead of `waggle-mcp`:
 
 ```bash
 which python3   # macOS / Linux
@@ -210,6 +226,50 @@ For the full tool surface and environment variable reference see [docs/reference
 
 ---
 
+## CLI Command Reference
+
+Waggle includes a built-in CLI for setup, maintenance, and learning the memory system.
+
+| Command | Description |
+|---|---|
+| `waggle-mcp --help` | Show all available commands, options, and usage examples. |
+| `waggle-mcp features` | **Recommended** — Explain the main tools, graph workflows, and how connected context reaches the model. |
+| `waggle-mcp init` | Interactive setup wizard to configure Codex, Claude, Cursor, or Antigravity. |
+| `waggle-mcp serve` | Run the MCP server (usually started automatically by your client). |
+| `waggle-mcp export-context-bundle` | Export a portable Markdown/JSON context pack for another AI. |
+| `waggle-mcp export-markdown-vault` | Export your memory graph as an Obsidian-style vault. |
+
+For advanced commands (tenant management, API keys, Neo4j migration), see the full help output:
+```bash
+waggle-mcp --help
+```
+
+---
+
+## Cross-Client Handoffs & Migration
+
+Waggle is designed to be a "portable brain" for your AI sessions. Whether you are switching editors (e.g., Antigravity to Codex) or moving across machines, your memory can follow you.
+
+### 1. Automatic Sharing (Same Machine)
+If you run multiple MCP clients (like Codex and Antigravity) on the same machine, they can share a single "brain" automatically. 
+*   **How:** Ensure both clients use the same `WAGGLE_DB_PATH` in their environment configuration (default is `~/.waggle/memory.db`).
+*   **Result:** A decision made in one editor is immediately known by the agent in the other.
+
+### 2. Session Handoffs (Context Bundles)
+If you hit a session limit or want to jump to a fresh context while keeping important facts:
+```bash
+# Export a condensed, AI-ready summary of your current project context
+waggle-mcp export-context-bundle --format markdown --output-path ./handoff.md
+```
+Paste the contents of `handoff.md` into your new session to "re-prime" the AI with your project's history.
+
+### 3. Full Memory Migration (Backup/Import)
+To move your entire memory history to a new machine:
+*   **Export:** `waggle-mcp export-graph-backup --output-path my_memory.json`
+*   **Import:** `waggle-mcp import-graph-backup --input-path my_memory.json`
+
+---
+
 ## Using It In MCP Clients
 
 Once installed, you usually do not run `waggle-mcp` commands by hand during daily work. Talk to the agent normally, and it calls Waggle MCP tools to store and retrieve memory.
@@ -217,12 +277,6 @@ Once installed, you usually do not run `waggle-mcp` commands by hand during dail
 - **Codex / Claude Code**: `observe_conversation`, `query_graph`, and `prime_context` are called automatically during normal threads.
 - **Cursor**: decisions and facts can be persisted as graph memory instead of getting lost in old chat windows.
 - **Antigravity**: conversation turns can be extracted via `observe_conversation`; context can be exported with `export_context_bundle`.
-
-For a built-in CLI explanation of the feature surface, run:
-
-```bash
-waggle-mcp features
-```
 
 ---
 
