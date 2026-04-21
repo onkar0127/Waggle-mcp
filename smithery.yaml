@@ -91,8 +91,8 @@ configSchema:
 
 commandFunction: |
   (config) => ({
-    command: 'uv',
-    args: ['run', '--project', '/app', '--no-sync', 'waggle-mcp', 'serve'],
+    command: 'python',
+    args: ['-m', 'waggle.server', 'serve'],
     env: {
       WAGGLE_MODEL: config.WAGGLE_MODEL || 'all-MiniLM-L6-v2',
       WAGGLE_BACKEND: config.WAGGLE_BACKEND || 'sqlite',

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import tomllib
 
 import waggle
@@ -26,6 +27,14 @@ def test_dockerfile_uses_module_entrypoint_for_arg_passthrough() -> None:
     assert "HF_HOME=/app/.cache/huggingface" in dockerfile
     assert "SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence-transformers" in dockerfile
     assert "SentenceTransformer('all-MiniLM-L6-v2')" in dockerfile
+
+
+def test_smithery_uses_installed_python_entrypoint() -> None:
+    smithery = (ROOT / "smithery.yaml").read_text()
+
+    assert "command: 'python'" in smithery
+    assert "args: ['-m', 'waggle.server', 'serve']" in smithery
+    assert not re.search(r"command:\\s*'uv'", smithery)
 
 
 def test_package_version_matches_pyproject() -> None:
