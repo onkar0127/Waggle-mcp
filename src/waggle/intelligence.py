@@ -620,9 +620,13 @@ def infer_temporal_hints(query: str, *, now: datetime | None = None) -> Temporal
         return TemporalQueryHints(since=now - timedelta(days=1), recency_mode="recent")
     if "yesterday" in lowered:
         return TemporalQueryHints(since=now - timedelta(days=2), until=now - timedelta(days=1), recency_mode="recent")
-    if any(term in lowered for term in ("latest", "most recent", "newest")):
+    if any(term in lowered for term in ("latest", "most recent", "newest", "current")):
         return TemporalQueryHints(recency_mode="latest")
-    if any(term in lowered for term in ("originally", "initially", "first discussed")):
+    if " now" in f" {lowered} " and any(
+        token in lowered for token in ("use", "uses", "choice", "backend", "deploy", "expiry", "format")
+    ):
+        return TemporalQueryHints(recency_mode="latest")
+    if any(term in lowered for term in ("original", "originally", "initially", "first discussed", "first")):
         return TemporalQueryHints(recency_mode="oldest")
     if any(term in lowered for term in ("recently", "lately", "recent")):
         return TemporalQueryHints(recency_mode="recent")

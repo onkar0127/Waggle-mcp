@@ -1103,6 +1103,96 @@ def test_implicit_reference_pm_gate_prefers_no_auto_promote(tmp_path: Path) -> N
     assert result.nodes[0].label == "No model auto-promotion"
 
 
+def test_temporal_current_phrase_prefers_latest_state(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="JWT expiry 15 minutes",
+        content="JWT tokens previously expired after 15 minutes.",
+        node_type=NodeType.FACT,
+    )
+    graph.add_node(
+        label="JWT expiry 1 hour",
+        content="JWT tokens now expire after 1 hour.",
+        node_type=NodeType.FACT,
+    )
+
+    result = graph.query(query="what is the current jwt expiry", max_nodes=1, max_depth=0)
+
+    assert result.nodes[0].label == "JWT expiry 1 hour"
+
+
+def test_temporal_latest_database_choice_prefers_database_fact(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="PostgreSQL production",
+        content="PostgreSQL is the production database for parity and safer migrations.",
+        node_type=NodeType.DECISION,
+    )
+    graph.add_node(
+        label="PostgreSQL updated choice",
+        content="Updated to PostgreSQL for production deployment and concurrent write support.",
+        node_type=NodeType.DECISION,
+    )
+
+    result = graph.query(query="what is the latest production database choice", max_nodes=1, max_depth=0)
+
+    assert result.nodes[0].label == "PostgreSQL production"
+
+
+def test_temporal_original_phrase_prefers_oldest_state(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="CSV only export",
+        content="CSV was the only export format initially.",
+        node_type=NodeType.FACT,
+    )
+    graph.add_node(
+        label="CSV and Parquet export",
+        content="Exports now support both CSV and Parquet for data warehouse sync.",
+        node_type=NodeType.FACT,
+    )
+
+    result = graph.query(query="what was the original export format", max_nodes=1, max_depth=0)
+
+    assert result.nodes[0].label == "CSV only export"
+
+
+def test_now_phrase_prefers_current_backend_choice(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="Redis session cache",
+        content="Redis handles session caching because TTL support is simple.",
+        node_type=NodeType.FACT,
+    )
+    graph.add_node(
+        label="KeyDB session cache",
+        content="KeyDB now handles session caching for active-active failover.",
+        node_type=NodeType.FACT,
+    )
+
+    result = graph.query(query="which cache backend handles sessions now", max_nodes=1, max_depth=0)
+
+    assert result.nodes[0].label == "KeyDB session cache"
+
+
+def test_temporal_latest_privacy_export_policy_prefers_approval_fact(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="CSV and Parquet export",
+        content="Exports now support both CSV and Parquet for data warehouse sync.",
+        node_type=NodeType.FACT,
+    )
+    graph.add_node(
+        label="Enterprise export approval",
+        content="Enterprise data exports now require admin approval and signed download links.",
+        node_type=NodeType.FACT,
+    )
+
+    result = graph.query(query="what is the latest enterprise data export policy", max_nodes=1, max_depth=0)
+
+    assert result.nodes[0].label == "Enterprise export approval"
+
+
 def test_graph_diff_and_prime_context(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
     graph.add_node(

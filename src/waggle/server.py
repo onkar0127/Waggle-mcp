@@ -58,6 +58,8 @@ from waggle.models import (
     SubgraphResult,
     TimelineResult,
     TopicResult,
+    TranscriptIngestionInput,
+    TranscriptMessage,
 )
 from waggle.rate_limit import RateLimiter
 from waggle.runtime_context import runtime_context
@@ -1733,6 +1735,45 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     import_markdown_vault.add_argument("--root-path", required=True)
 
+    ingest_transcript_handoff = subparsers.add_parser(
+        "ingest-transcript-handoff",
+        help="Ingest a full session transcript as a rollover handoff, extract memory, and export a context bundle.",
+        description=(
+            "Client-triggered rollover handoff: pass the full ordered transcript as JSON, "
+            "Waggle stores all messages as transcript provenance, extracts durable memory from "
+            "logical user->assistant turns, and exports a session-scoped context bundle. "
+            "Supported backend: SQLite only in v1. Neo4j support is deferred."
+        ),
+    )
+    ingest_transcript_handoff.add_argument(
+        "--input",
+        default="-",
+        metavar="PATH_OR_DASH",
+        help="Path to the JSON transcript file, or '-' to read from stdin (default: stdin).",
+    )
+    ingest_transcript_handoff.add_argument("--project", default="", help="Scope override: project name.")
+    ingest_transcript_handoff.add_argument("--agent-id", default="", help="Scope override: agent identifier.")
+    ingest_transcript_handoff.add_argument("--session-id", default="", help="Scope override: session identifier.")
+    ingest_transcript_handoff.add_argument("--output-path", default=None, help="Optional export output path prefix.")
+    ingest_transcript_handoff.add_argument(
+        "--export-format",
+        choices=["markdown", "json", "both"],
+        default="both",
+        help="Export format for the post-ingestion context bundle (default: both).",
+    )
+    ingest_transcript_handoff.add_argument(
+        "--max-nodes",
+        type=int,
+        default=25,
+        help="Maximum nodes included in the exported context bundle (default: 25).",
+    )
+    ingest_transcript_handoff.add_argument(
+        "--max-input-bytes",
+        type=int,
+        default=16 * 1024 * 1024,
+        help="Hard input-size cap in bytes (default: 16 MiB). Oversized payloads fail with exit code 1.",
+    )
+
     subparsers.add_parser("init", help="Interactive setup wizard — configure an MCP client to use waggle-mcp.")
     subparsers.add_parser(
         "features",
@@ -1822,10 +1863,137 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         imported = backend.import_markdown_vault(root_path=args.root_path)
         print(json.dumps(imported.model_dump(mode="json"), indent=2))
         return 0
+    if args.command == "ingest-transcript-handoff":
+        return _run_ingest_transcript_handoff(config, args)
     if args.command == "features":
         print(_FEATURES_GUIDE)
         return 0
     raise ValidationFailure(f"Unknown command: {args.command}")
+
+
+# ---------------------------------------------------------------------------
+# ingest-transcript-handoff CLI helpers
+# ---------------------------------------------------------------------------
+
+
+def _emit_cli_error(code: str, message: str, details: dict[str, Any]) -> None:
+    """Write a structured failure JSON object to stderr."""
+    payload = {"code": code, "message": message, "details": details}
+    sys.stderr.write(json.dumps(payload) + "\n")
+    sys.stderr.flush()
+
+
+def _run_ingest_transcript_handoff(config: AppConfig, args: argparse.Namespace) -> int:
+    """Execute the ingest-transcript-handoff CLI command.
+
+    Exit codes:
+      0  — success
+      1  — input or validation failure
+      2  — backend / graph / export failure
+      3  — unexpected internal error
+    """
+    max_bytes: int = args.max_input_bytes
+
+    # ── Load raw input ──────────────────────────────────────────────────────
+    try:
+        input_arg: str = args.input
+        if input_arg == "-":
+            raw = sys.stdin.buffer.read(max_bytes + 1)
+        else:
+            path = Path(input_arg)
+            if not path.exists():
+                _emit_cli_error("input_not_found", f"Input file not found: {input_arg}", {})
+                return 1
+            raw = path.read_bytes()[: max_bytes + 1]
+    except OSError as exc:
+        _emit_cli_error("input_read_error", str(exc), {})
+        return 1
+
+    if len(raw) > max_bytes:
+        _emit_cli_error(
+            "payload_too_large",
+            f"Input exceeds --max-input-bytes ({max_bytes} bytes).",
+            {"max_input_bytes": max_bytes},
+        )
+        return 1
+
+    # ── Parse JSON ──────────────────────────────────────────────────────────
+    try:
+        payload_dict = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        _emit_cli_error("malformed_json", f"JSON parse error: {exc}", {})
+        return 1
+
+    if not isinstance(payload_dict, dict):
+        _emit_cli_error("invalid_format", "Input must be a JSON object.", {})
+        return 1
+
+    if "messages" not in payload_dict:
+        _emit_cli_error("missing_field", "Input JSON must contain a 'messages' key.", {})
+        return 1
+
+    # ── Validate via Pydantic ───────────────────────────────────────────────
+    try:
+        payload = TranscriptIngestionInput.model_validate(payload_dict)
+    except Exception as exc:
+        _emit_cli_error("validation_error", str(exc), {})
+        return 1
+
+    # ── CLI scope flags override JSON fields ────────────────────────────────
+    if getattr(args, "project", ""):
+        payload.project = args.project.strip()
+    if getattr(args, "agent_id", ""):
+        payload.agent_id = args.agent_id.strip()
+    if getattr(args, "session_id", ""):
+        payload.session_id = args.session_id.strip()
+
+    # ── Run ingestion ───────────────────────────────────────────────────────
+    try:
+        backend = _build_backend(config)
+        result = backend.ingest_transcript_handoff(
+            payload,
+            export_format=args.export_format,
+            output_path=args.output_path,
+            max_nodes=args.max_nodes,
+        )
+    except ValidationFailure as exc:
+        _emit_cli_error("validation_error", str(exc), {})
+        return 1
+    except WaggleError as exc:
+        _emit_cli_error(exc.code, str(exc), {"status_code": exc.status_code})
+        return 2
+    except Exception as exc:
+        _emit_cli_error("backend_error", str(exc), {"type": type(exc).__name__})
+        return 2
+
+    # ── Emit success JSON to stdout ─────────────────────────────────────────
+    output: dict[str, Any] = {
+        "scope": {
+            "project": result.project,
+            "agent_id": result.agent_id,
+            "session_id": result.session_id,
+        },
+        "input_message_count": result.input_message_count,
+        "transcript_records_written": result.transcript_records_written,
+        "transcript_records_skipped": result.transcript_records_skipped,
+        "logical_turns_processed": result.logical_turns_processed,
+        "unpaired_trailing_blocks": result.unpaired_trailing_blocks,
+        "nodes_created": result.nodes_created,
+        "nodes_reused": result.nodes_reused,
+        "conflicts": result.conflicts,
+    }
+    if result.export_skipped:
+        output["export_skipped"] = True
+        output["export_skipped_reason"] = result.export_skipped_reason
+    else:
+        output["export_skipped"] = False
+        output["markdown_path"] = result.markdown_path
+        output["json_path"] = result.json_path
+        output["export_node_count"] = result.export_node_count
+        output["export_edge_count"] = result.export_edge_count
+
+    print(json.dumps(output, indent=2))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2067,7 +2235,18 @@ def main() -> None:
     configure_logging(config.log_level, stream=log_stream)
     LOGGER.info("waggle_startup")
     if command != "serve":
-        _run_admin_command(config, args)
+        try:
+            exit_code = _run_admin_command(config, args)
+        except ValidationFailure as exc:
+            _emit_cli_error("validation_error", str(exc), {})
+            sys.exit(1)
+        except WaggleError as exc:
+            _emit_cli_error(exc.code, str(exc), {"status_code": exc.status_code})
+            sys.exit(2)
+        except Exception as exc:
+            _emit_cli_error("internal_error", str(exc), {"type": type(exc).__name__})
+            sys.exit(3)
+        sys.exit(exit_code or 0)
         return
     if config.transport == "http":
         run_http(config)

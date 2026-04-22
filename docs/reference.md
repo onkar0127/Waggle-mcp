@@ -184,6 +184,7 @@ After Waggle is installed as an MCP server, the normal workflow is conversationa
 - Work in a normal Codex thread.
 - Codex can use `observe_conversation`, `store_node`, `store_edge`, `query_graph`, and `prime_context` to persist and retrieve memory.
 - Later tasks can recover connected graph context even when the original thread is no longer in the current window.
+- To make this automatic rather than manual, add a Codex instruction/rule telling the agent to call `prime_context` at session start, `query_graph` before context-dependent answers, and `observe_conversation` after durable turns.
 
 ### Claude Code
 
@@ -200,6 +201,7 @@ After Waggle is installed as an MCP server, the normal workflow is conversationa
 
 - Antigravity can use Waggle as a persistent graph memory backend over MCP.
 - Conversation memory can be extracted with `observe_conversation`, and linked context can be exported with `export_context_bundle`.
+- For automatic recall, add a User Rule / custom instruction telling the agent to use `prime_context`, `query_graph`, and `observe_conversation` in the background; `mcp_config.json` alone only registers the tool.
 
 ### Important behavior
 
@@ -237,6 +239,22 @@ The MCP server also exposes this behavior as:
 
 - prompt: `waggle_memory_policy`
 - resource: `graph://memory-policy`
+
+Recommended rule text for Codex and Antigravity:
+
+```text
+Use Waggle automatically for conversational memory.
+
+At the start of a new session, if project, agent, or session scope is known, call prime_context.
+
+Before answering questions that may depend on prior decisions, preferences, constraints, project state, or earlier conversation context, call query_graph with the narrowest relevant scope.
+
+After completed turns that contain durable information such as decisions, preferences, constraints, requirements, user corrections, project facts, or meaningful task outcomes, call observe_conversation automatically.
+
+Do not ask the user to trigger Waggle manually. Use it in the background when relevant.
+```
+
+A reusable copy also lives in [automatic-memory-rules.md](./automatic-memory-rules.md).
 
 ## Environment variables
 
@@ -396,3 +414,175 @@ Naive RAG often stuffs irrelevant chunks into the prompt, wasting tokens and con
 > - [id:db_postgres] "PostgreSQL production" - PostgreSQL is the prod DB.
 >   - *Updates*: "SQLite local only"
 >   - *Contradicts*: "SQLite local only" (superseded-state)
+
+---
+
+## Memory ingestion paths
+
+Waggle has two complementary ingestion paths. Use the right one for the situation:
+
+| Path | When to use | Tool/command |
+|------|-------------|-------------|
+| **Live chat memory** | After every completed turn during an active session | `observe_conversation` MCP tool (or via orchestration) |
+| **Rollover handoff** | When a chat window is full or a session is ending | `waggle-mcp ingest-transcript-handoff` CLI |
+
+The client is responsible for detecting rollover and calling Waggle with the raw transcript JSON. Waggle does not monitor session length.
+
+Both paths share the same extraction and edge-linking internals, so memory semantics are aligned.
+
+---
+
+## Rollover transcript handoff: `ingest-transcript-handoff`
+
+> **Backend support:** SQLite only in v1. Neo4j support for this command is deferred and not yet implemented. A Neo4j backend will return an error if this command is invoked against it.
+
+### Usage
+
+```bash
+# From a file
+waggle-mcp ingest-transcript-handoff --input transcript.json --session-id my-session
+
+# From stdin
+cat transcript.json | waggle-mcp ingest-transcript-handoff --input -
+
+# With scope overrides and custom export path
+waggle-mcp ingest-transcript-handoff \
+  --input transcript.json \
+  --project my-project \
+  --agent-id claude-3-7 \
+  --session-id session-abc \
+  --export-format markdown \
+  --max-nodes 30 \
+  --output-path ./handoff-bundle
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input PATH\|-` | `-` (stdin) | Path to the JSON transcript file, or `-` for stdin |
+| `--project` | `""` | Scope override: project name |
+| `--agent-id` | `""` | Scope override: agent identifier |
+| `--session-id` | `""` | Scope override: session identifier |
+| `--output-path` | auto | Optional export path prefix |
+| `--export-format` | `both` | `markdown`, `json`, or `both` |
+| `--max-nodes` | `25` | Max nodes in the exported context bundle |
+| `--max-input-bytes` | `16777216` | Hard input cap (16 MiB). Oversized payloads fail with exit code 1 |
+
+CLI scope flags override any scope fields in the JSON payload.
+
+### Input JSON shape
+
+```json
+{
+  "project": "optional-project",
+  "agent_id": "optional-agent-id",
+  "session_id": "optional-session-id",
+  "messages": [
+    {
+      "role": "user|assistant|system|tool",
+      "content": "non-empty text",
+      "timestamp": "optional ISO-8601 string",
+      "message_id": "optional stable client id"
+    }
+  ]
+}
+```
+
+- `system` and `tool` roles are accepted and stored as transcript provenance. They are **not** used as extraction inputs and do **not** split or interrupt `user`/`assistant` blocks (v1 behavior).
+- All four roles are stored in transcript provenance. Only `user` and `assistant` messages participate in logical turn extraction.
+- An empty `messages` array (`[]`) is valid and returns exit code `0` with all-zero counts and `export_skipped: true`.
+
+### Success output (stdout)
+
+```json
+{
+  "scope": { "project": "", "agent_id": "", "session_id": "my-session" },
+  "input_message_count": 4,
+  "transcript_records_written": 4,
+  "transcript_records_skipped": 0,
+  "logical_turns_processed": 2,
+  "unpaired_trailing_blocks": 0,
+  "nodes_created": 3,
+  "nodes_reused": 1,
+  "conflicts": 0,
+  "export_skipped": false,
+  "markdown_path": "/path/to/bundle.md",
+  "json_path": "/path/to/bundle.json",
+  "export_node_count": 7,
+  "export_edge_count": 4
+}
+```
+
+When no export is produced: `"export_skipped": true, "export_skipped_reason": "no_messages"`.
+
+### Failure output (stderr)
+
+```json
+{
+  "code": "payload_too_large",
+  "message": "Input exceeds --max-input-bytes (16777216 bytes).",
+  "details": { "max_input_bytes": 16777216 }
+}
+```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | Input or validation failure (malformed JSON, missing field, unsupported role, oversized payload) |
+| `2` | Backend / graph / export failure |
+| `3` | Unexpected internal error |
+
+### Block-windowing algorithm (v1)
+
+The command uses a deterministic algorithm to convert the ordered message list into logical extraction turns:
+
+1. Persist every message to `transcript_records`.
+2. Build an **extractive stream** by keeping only `user` and `assistant` messages. `system` and `tool` messages are skipped.
+3. **Collapse** consecutive same-role extractive messages into one block, joining text with `\n\n`.
+4. Scan collapsed blocks left to right:
+   - `user` followed by `assistant` → one **logical turn** (extracted from both).
+   - Leading `assistant` block with no prior `user` → transcript-only, skipped for extraction.
+   - Trailing `user` block with no following `assistant` → transcript-only, counted as `unpaired_trailing_blocks`.
+5. After consuming one `user → assistant` pair, continue from the next remaining block.
+
+**Example:** `user → user → assistant → user → assistant` becomes two logical turns:
+- `(user+user) → assistant`
+- `user → assistant`
+
+### Tool-interleaving behavior (v1 simplification)
+
+- `user → tool → tool → assistant` becomes **one logical turn**: `user → assistant`
+- `user → assistant → tool → tool → assistant` becomes **one logical turn**: `user → (assistant + assistant)`
+
+This is a known v1 simplification. Tool messages do not split or interrupt extractive blocks. A `tool_boundary_splits_blocks` option is a planned v2 refinement.
+
+### Idempotency and dedup contract
+
+- If `message_id` is present, it is used as the stable transcript identity.
+- If `message_id` is absent, a deterministic positional fingerprint is computed from `(role, content, raw_position, timestamp-or-empty)`.
+- Uniqueness is enforced per `(tenant_id, session_id, message_identity)`.
+- Re-ingesting the **identical transcript** with the same session ID and same positions is a no-op at the transcript layer: no new records are written, no turns are reprocessed.
+
+**Fingerprint limitation (v1):** Positional fingerprints are only idempotent for identical reruns. If the client prepends, removes, reorders, or partially resubmits messages, those changed positions are treated as new input. Use stable `message_id` values to avoid this.
+
+### Retention policy
+
+Transcript provenance is stored indefinitely in this version. There is no automatic cleanup or expiry. Future versions may add a retention tooling command. Callers that need to prune data should use direct database tooling or wait for a future `prune-transcripts` command.
+
+### Token budget
+
+v1 does not have a `--max-context-tokens` flag. Export is bounded by `--max-nodes`. Token-budgeted export is a planned later enhancement.
+
+### v2 backlog
+
+The following refinements are intentional omissions, not oversights:
+
+- `tool_boundary_splits_blocks` option: allow tool messages to terminate an assistant block.
+- Token-budgeted export flag (in addition to `--max-nodes`).
+- Stdin read timeouts (callers can wrap `ingest-transcript-handoff` with a wall-clock timeout).
+- Streaming NDJSON input format.
+- Transcript retention/cleanup command.
+- Neo4j backend support.

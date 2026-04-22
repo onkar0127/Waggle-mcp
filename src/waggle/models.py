@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -422,3 +422,91 @@ class FusionHit(BaseModel):
     session_id: str | None = None
     transcript_snippet: str | None = None
     turn_index: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Transcript handoff ingestion models
+# ---------------------------------------------------------------------------
+
+
+ALLOWED_TRANSCRIPT_ROLES = frozenset({"user", "assistant", "system", "tool"})
+EXTRACTION_ROLES = frozenset({"user", "assistant"})
+
+
+class TranscriptMessage(BaseModel):
+    """One message in a transcript handoff payload."""
+
+    role: str
+    content: str
+    timestamp: Optional[str] = None
+    message_id: Optional[str] = None
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _validate_role(cls, value: Any) -> str:
+        text = str(value).strip().lower()
+        if text not in ALLOWED_TRANSCRIPT_ROLES:
+            raise ValueError(
+                f"Unsupported role '{value}'. Allowed roles: {sorted(ALLOWED_TRANSCRIPT_ROLES)}"
+            )
+        return text
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _validate_content(cls, value: Any) -> str:
+        if value is None:
+            raise ValueError("Message content is required.")
+        text = str(value).strip()
+        if not text:
+            raise ValueError("Message content cannot be empty.")
+        return text
+
+    @field_validator("message_id", "timestamp", mode="before")
+    @classmethod
+    def _normalize_optional_str(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        stripped = str(value).strip()
+        return stripped if stripped else None
+
+
+class TranscriptIngestionInput(BaseModel):
+    """Top-level JSON payload for ingest-transcript-handoff."""
+
+    messages: list[TranscriptMessage] = Field(default_factory=list)
+    project: str = ""
+    agent_id: str = ""
+    session_id: str = ""
+
+    @field_validator("project", "agent_id", "session_id", mode="before")
+    @classmethod
+    def _normalize_scope(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+
+class TranscriptIngestionResult(BaseModel):
+    """Result returned by the batch transcript ingestion backend helper."""
+
+    # Resolved scope
+    project: str = ""
+    agent_id: str = ""
+    session_id: str = ""
+    # Input counts
+    input_message_count: int = 0
+    transcript_records_written: int = 0
+    transcript_records_skipped: int = 0
+    logical_turns_processed: int = 0
+    unpaired_trailing_blocks: int = 0
+    # Node extraction counts
+    nodes_created: int = 0
+    nodes_reused: int = 0
+    conflicts: int = 0
+    # Export metadata
+    export_skipped: bool = False
+    export_skipped_reason: str = ""
+    markdown_path: Optional[str] = None
+    json_path: Optional[str] = None
+    export_node_count: int = 0
+    export_edge_count: int = 0

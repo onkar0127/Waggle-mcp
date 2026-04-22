@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import heapq
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -84,6 +86,9 @@ from waggle.models import (
     RecentNodeStat,
     RelationType,
     SubgraphResult,
+    TranscriptIngestionInput,
+    TranscriptIngestionResult,
+    TranscriptMessage,
     TranscriptRecord,
     normalize_relationship,
     TenantRecord,
@@ -93,7 +98,9 @@ from waggle.models import (
     utc_now,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -122,6 +129,7 @@ RELATION_SCORE_BOOST: dict[str, float] = {
 }
 TOPIC_RELEVANCE_THRESHOLD = 0.35
 TOPIC_SEMANTIC_ONLY_THRESHOLD = 0.70
+TEMPORAL_TOPIC_MARGIN = 0.03
 NEGATION_QUERY_TERMS = (
     "not",
     "never",
@@ -160,13 +168,26 @@ QUERY_ALIAS_TERMS: tuple[tuple[str, str], ...] = (
     ("ingestion and export", "ingestion import ndjson export csv parquet warehouse sync"),
     ("ingestion", "ingestion import ndjson streaming imports"),
     ("export", "export csv parquet warehouse sync signed download links"),
+    ("enterprise data export policy", "enterprise data export policy admin approval signed download links"),
+    ("privacy export stance", "privacy export policy admin approval signed download links"),
+    ("privacy export", "privacy export policy admin approval signed download links"),
+    ("export policy", "export policy admin approval signed download links"),
     ("database", "postgresql mysql sqlite database production"),
+    ("production database choice", "postgresql production database choice current parity safer migrations"),
+    ("auto rollback", "auto rollback deployments incident 5xx"),
     ("acid compliance", "acid compliance transactions consistency postgres decision reason"),
     ("justified by", "reason rationale because requirement constraint"),
     ("deployment platform", "cloud run ecs deployment deploy autoscaling"),
     ("deployment", "cloud run ecs deployment deploy autoscaling"),
     ("deploy", "cloud run ecs deployment rollback"),
+    ("api deploy", "api deploy cloud run ecs autoscaling"),
+    ("deploy now", "current deployment cloud run autoscaling"),
     ("auth", "jwt token expiry refresh authentication"),
+    ("jwt expiry", "jwt token expiry 15m 1h authentication"),
+    ("session cache backend", "session cache backend redis keydb ttl failover"),
+    ("cache backend", "session cache backend redis keydb ttl failover"),
+    ("workflow backend", "workflow backend temporal celery redis retries visibility"),
+    ("workflow backend do we use now", "current workflow backend temporal retries visibility"),
     ("mobile offline", "offline queue sync mobile edits"),
     ("production incidents", "incident rollback auto-rollback 5xx error rate"),
     ("incidents", "incident rollback auto-rollback 5xx error rate"),
@@ -217,7 +238,7 @@ MUST_PAIR_RELATIONS: frozenset[str] = frozenset({
 })
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 SCHEMA_SQL = """
@@ -290,7 +311,8 @@ CREATE TABLE IF NOT EXISTS transcript_records (
     role TEXT NOT NULL DEFAULT '',
     transcript_text TEXT NOT NULL,
     embedding BLOB,
-    metadata TEXT DEFAULT '{}'
+    metadata TEXT DEFAULT '{}',
+    message_identity TEXT DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
@@ -579,6 +601,22 @@ class MemoryGraph:
                 f"ALTER TABLE edges ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '{self.tenant_id}'"
             )
             connection.execute("UPDATE edges SET tenant_id = ? WHERE tenant_id = ''", (self.tenant_id,))
+        transcript_columns = {row["name"] for row in connection.execute("PRAGMA table_info(transcript_records)").fetchall()}
+        if "message_identity" not in transcript_columns:
+            connection.execute(
+                "ALTER TABLE transcript_records ADD COLUMN message_identity TEXT DEFAULT NULL"
+            )
+        # Always ensure the partial unique index exists (IF NOT EXISTS is safe for reruns).
+        # Must be outside the if-block so new databases (where the column comes from CREATE TABLE)
+        # also get the index, not just existing databases that went through ALTER TABLE.
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_transcripts_identity
+            ON transcript_records(tenant_id, session_id, message_identity)
+            WHERE message_identity IS NOT NULL
+            """
+        )
+
         connection.execute(
             """
             INSERT OR IGNORE INTO schema_migrations (version, applied_at)
@@ -1977,48 +2015,32 @@ class MemoryGraph:
             total_nodes_in_graph=self.get_stats().total_nodes,
         )
 
-    def observe_conversation(
+    def _apply_observation_candidates(
         self,
         *,
-        user_message: str,
-        assistant_response: str,
-        agent_id: str = "",
-        project: str = "",
-        session_id: str = "",
+        candidates: list[dict[str, Any]],
+        transcript: str,
+        user_turn_index: int,
+        assistant_turn_index: int,
+        observed_at: datetime,
+        session_id: str,
+        agent_id: str,
+        project: str,
+        edge_origin: str = "observe_conversation",
     ) -> ObservationResult:
-        transcript = f"user: {user_message.strip()}\nassistant: {assistant_response.strip()}".strip()
-        observed_at = utc_now()
-        candidates = extract_conversation_candidates(
-            user_message=user_message,
-            assistant_response=assistant_response,
-        )
+        """Shared extraction helper used by both observe_conversation and ingest_transcript_handoff.
 
+        Takes pre-extracted candidates and stores them as nodes with evidence,
+        then links decision->rationale edges.  Both single-turn and batch paths call this
+        so memory semantics stay aligned.
+        """
         result = ObservationResult()
         stored_candidate_records: list[tuple[Node, list[str]]] = []
-        with self._lock, self._connect() as connection:
-            next_turn_index = self._next_transcript_turn_index(connection, session_id=session_id)
-            turns = [
-                ("user", user_message.strip(), next_turn_index),
-                ("assistant", assistant_response.strip(), next_turn_index + 1),
-            ]
-            for role, text, turn_index in turns:
-                if not text:
-                    continue
-                self._store_transcript_record(
-                    connection,
-                    agent_id=agent_id,
-                    project=project,
-                    session_id=session_id,
-                    observed_at=observed_at,
-                    turn_index=turn_index,
-                    role=role,
-                    transcript_text=text,
-                )
         for candidate in candidates:
             candidate_tags = list(candidate.get("tags", []))
             speaker_tag = next((tag for tag in candidate_tags if str(tag).startswith("speaker:")), "")
             speaker = speaker_tag.split(":", 1)[1] if ":" in speaker_tag else "user"
-            turn_index = next_turn_index if speaker == "user" else next_turn_index + 1
+            turn_index = user_turn_index if speaker == "user" else assistant_turn_index
             evidence = build_observation_evidence(
                 transcript=transcript,
                 source_text=str(candidate["content"]),
@@ -2069,9 +2091,346 @@ class MemoryGraph:
                     source_id=decision_node.id,
                     target_id=rationale_node.id,
                     relationship=RelationType.DEPENDS_ON,
-                    metadata={"origin": "observe_conversation"},
+                    metadata={"origin": edge_origin},
                 )
         return result
+
+    def observe_conversation(
+        self,
+        *,
+        user_message: str,
+        assistant_response: str,
+        agent_id: str = "",
+        project: str = "",
+        session_id: str = "",
+    ) -> ObservationResult:
+        transcript = f"user: {user_message.strip()}\nassistant: {assistant_response.strip()}".strip()
+        observed_at = utc_now()
+        candidates = extract_conversation_candidates(
+            user_message=user_message,
+            assistant_response=assistant_response,
+        )
+
+        with self._lock, self._connect() as connection:
+            next_turn_index = self._next_transcript_turn_index(connection, session_id=session_id)
+            turns = [
+                ("user", user_message.strip(), next_turn_index),
+                ("assistant", assistant_response.strip(), next_turn_index + 1),
+            ]
+            for role, text, turn_index in turns:
+                if not text:
+                    continue
+                self._store_transcript_record(
+                    connection,
+                    agent_id=agent_id,
+                    project=project,
+                    session_id=session_id,
+                    observed_at=observed_at,
+                    turn_index=turn_index,
+                    role=role,
+                    transcript_text=text,
+                )
+
+        return self._apply_observation_candidates(
+            candidates=candidates,
+            transcript=transcript,
+            user_turn_index=next_turn_index,
+            assistant_turn_index=next_turn_index + 1,
+            observed_at=observed_at,
+            session_id=session_id,
+            agent_id=agent_id,
+            project=project,
+        )
+
+    # ---------------------------------------------------------------------------
+    # Batch transcript ingestion (ingest-transcript-handoff)
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _message_fingerprint(msg: TranscriptMessage, raw_position: int) -> str:
+        """Compute a stable dedup identity for a transcript message.
+
+        If the message supplies a client-side ``message_id``, use it directly.
+        Otherwise compute a deterministic positional fingerprint from
+        (role, content, raw_position, timestamp-or-empty).
+
+        Positional fingerprints are idempotent only for identical reruns.
+        Prepending, removing, or reordering messages in a partial resubmit
+        will produce different fingerprints and be treated as new input.
+        This is a documented v1 limitation.
+        """
+        if msg.message_id:
+            return msg.message_id
+        payload = "\x00".join([
+            msg.role,
+            msg.content,
+            str(raw_position),
+            msg.timestamp or "",
+        ])
+        return "fp:" + hashlib.sha256(payload.encode()).hexdigest()
+
+    @staticmethod
+    def _build_extractive_blocks(
+        messages: list[TranscriptMessage],
+    ) -> list[tuple[str, str]]:
+        """Collapse consecutive same-role extractive (user/assistant) messages into blocks.
+
+        system and tool messages are skipped for block formation but do not
+        split or interrupt blocks.  This is the v1 rule; see docs/backlog for
+        the tool_boundary_splits_blocks refinement.
+
+        Returns a list of (role, joined_content) tuples.
+        """
+        blocks: list[tuple[str, str]] = []
+        for msg in messages:
+            if msg.role not in ("user", "assistant"):
+                # system/tool: skip for block purposes, no split
+                continue
+            if blocks and blocks[-1][0] == msg.role:
+                # Collapse consecutive same-role messages
+                blocks[-1] = (blocks[-1][0], blocks[-1][1] + "\n\n" + msg.content)
+            else:
+                blocks.append((msg.role, msg.content))
+        return blocks
+
+    @staticmethod
+    def _build_session_extractive_blocks(
+        rows: list[Any],
+        newly_written_identities: set[str],
+    ) -> list[tuple[str, str, int, bool]]:
+        """Build extractive blocks from the full ordered session transcript (from DB rows).
+
+        Each block is (role, joined_content, first_turn_index, has_new_message).
+        - role: 'user' or 'assistant' (system/tool rows are skipped).
+        - joined_content: consecutive same-role messages joined with '\n\n'.
+        - first_turn_index: the turn_index of the first row that contributed to this block.
+        - has_new_message: True if ANY message in this block was newly written this run.
+
+        This is the correct block-scan surface for extraction: it sees the full
+        session history so a previously-unpaired trailing user can be completed by
+        a newly-arrived assistant message in the next ingestion call.
+        """
+        blocks: list[tuple[str, str, int, bool]] = []
+        for row in rows:
+            role: str = row["role"]
+            if role not in ("user", "assistant"):
+                continue
+            content: str = row["transcript_text"]
+            turn_index: int = row["turn_index"]
+            identity: str | None = row["message_identity"]
+            is_new = identity in newly_written_identities if identity else False
+            if blocks and blocks[-1][0] == role:
+                prev_role, prev_content, prev_turn, prev_new = blocks[-1]
+                blocks[-1] = (prev_role, prev_content + "\n\n" + content, prev_turn, prev_new or is_new)
+            else:
+                blocks.append((role, content, turn_index, is_new))
+        return blocks
+
+    def ingest_transcript_handoff(
+        self,
+        payload: TranscriptIngestionInput,
+        *,
+        export_format: str = "both",
+        output_path: str | None = None,
+        max_nodes: int = 25,
+    ) -> TranscriptIngestionResult:
+        """Batch-ingest a full ordered transcript, extract durable memory from logical turns,
+        and optionally export a session-scoped handoff bundle.
+
+        Supported backend: SQLite only in v1.  Neo4j support is deferred.
+
+        Algorithm (block-windowing):
+        1. Persist every message to transcript_records with dedup via message_identity.
+        2. Build an extractive stream keeping only user/assistant messages.
+        3. Collapse consecutive same-role extractive messages into one block.
+        4. Scan collapsed blocks left to right:
+           - user -> assistant   => one logical turn (extract from both).
+           - leading assistant   => transcript-only, skipped for extraction.
+           - trailing user       => transcript-only, counted as unpaired.
+        5. After consuming a u->a pair, continue from the next remaining block.
+
+        Tool-interleaving behavior (v1 simplification, documented):
+        - user -> tool -> tool -> assistant  =>  one logical turn: user -> assistant.
+        - user -> assistant -> tool -> tool -> assistant => user -> (assistant + assistant).
+        Tool boundary splitting is a planned v2 refinement.
+        """
+        result = TranscriptIngestionResult(
+            project=payload.project,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+        )
+
+        if not payload.messages:
+            result.export_skipped = True
+            result.export_skipped_reason = "no_messages"
+            return result
+
+        result.input_message_count = len(payload.messages)
+        observed_at = utc_now()
+
+        # Step 2: Persist all messages; collect identities of newly written ones.
+        newly_written_identities: set[str] = set()
+        with self._lock, self._connect() as connection:
+            base_turn_index = self._next_transcript_turn_index(
+                connection, session_id=payload.session_id
+            )
+            for raw_pos, msg in enumerate(payload.messages):
+                identity = self._message_fingerprint(msg, raw_pos)
+                written = self._store_transcript_record(
+                    connection,
+                    agent_id=payload.agent_id,
+                    project=payload.project,
+                    session_id=payload.session_id,
+                    observed_at=observed_at,
+                    turn_index=base_turn_index + raw_pos,
+                    role=msg.role,
+                    transcript_text=msg.content,
+                    message_identity=identity,
+                )
+                if written:
+                    result.transcript_records_written += 1
+                    newly_written_identities.add(identity)
+                else:
+                    result.transcript_records_skipped += 1
+
+        # If every message was a duplicate (full re-run), skip extraction.
+        if result.transcript_records_written == 0:
+            result.export_skipped = True
+            result.export_skipped_reason = "all_messages_already_ingested"
+            # Still produce an export bundle from existing session memory.
+            _export = self._maybe_export_bundle(
+                payload=payload,
+                export_format=export_format,
+                output_path=output_path,
+                max_nodes=max_nodes,
+            )
+            if _export is not None:
+                result.export_skipped = False
+                result.markdown_path = _export.get("markdown_path")
+                result.json_path = _export.get("json_path")
+                result.export_node_count = _export.get("node_count", 0)
+                result.export_edge_count = _export.get("edge_count", 0)
+            return result
+
+        # Step 3: Load the FULL session transcript from the DB ordered by turn_index.
+        # We must scan the full session — not just newly written messages — so that a
+        # previously-unpaired trailing user block can be paired with an assistant that
+        # arrives in a later ingestion call.
+        with self._lock, self._connect() as connection:
+            session_rows = connection.execute(
+                """
+                SELECT role, transcript_text, turn_index, message_identity
+                FROM transcript_records
+                WHERE tenant_id = ? AND session_id = ?
+                ORDER BY turn_index ASC, id ASC
+                """,
+                (self.tenant_id, payload.session_id),
+            ).fetchall()
+
+        # Step 4: Build session-scoped extractive blocks, each tagged with
+        # has_new_message=True iff any row in that block was newly written this run.
+        # (role, joined_content, first_turn_index, has_new_message)
+        session_blocks = self._build_session_extractive_blocks(
+            session_rows, newly_written_identities
+        )
+
+        # Step 5: Scan blocks left to right; only extract turns where at least
+        # one of the two blocks (user or assistant) has a new message.
+        # This prevents re-extraction of already-processed turns while still
+        # completing trailing-user blocks when their assistant reply arrives later.
+        i = 0
+        while i < len(session_blocks):
+            role, content, role_turn_index, block_has_new = session_blocks[i]
+            if role == "assistant":
+                # Leading or orphaned assistant: transcript-only, skip.
+                i += 1
+                continue
+            # role == "user"
+            if i + 1 < len(session_blocks) and session_blocks[i + 1][0] == "assistant":
+                user_content = content
+                user_turn_index = role_turn_index
+                user_has_new = block_has_new
+                assistant_content = session_blocks[i + 1][1]
+                assistant_turn_index = session_blocks[i + 1][2]
+                asst_has_new = session_blocks[i + 1][3]
+                if user_has_new or asst_has_new:
+                    transcript = f"user: {user_content}\nassistant: {assistant_content}"
+                    candidates = extract_conversation_candidates(
+                        user_message=user_content,
+                        assistant_response=assistant_content,
+                    )
+                    turn_result = self._apply_observation_candidates(
+                        candidates=candidates,
+                        transcript=transcript,
+                        user_turn_index=user_turn_index,
+                        assistant_turn_index=assistant_turn_index,
+                        observed_at=observed_at,
+                        session_id=payload.session_id,
+                        agent_id=payload.agent_id,
+                        project=payload.project,
+                        edge_origin="ingest_transcript_handoff",
+                    )
+                    result.logical_turns_processed += 1
+                    result.nodes_created += turn_result.created_count
+                    result.nodes_reused += turn_result.reused_count
+                    result.conflicts += len(turn_result.conflicts)
+                i += 2
+            else:
+                # Trailing user block with no following assistant: transcript-only.
+                result.unpaired_trailing_blocks += 1
+                i += 1
+
+        # Step 5: Export a session-scoped prime bundle.
+        _export = self._maybe_export_bundle(
+            payload=payload,
+            export_format=export_format,
+            output_path=output_path,
+            max_nodes=max_nodes,
+        )
+        if _export is not None:
+            result.markdown_path = _export.get("markdown_path")
+            result.json_path = _export.get("json_path")
+            result.export_node_count = _export.get("node_count", 0)
+            result.export_edge_count = _export.get("edge_count", 0)
+        else:
+            result.export_skipped = True
+            result.export_skipped_reason = "no_nodes_in_session"
+        return result
+
+    def _maybe_export_bundle(
+        self,
+        *,
+        payload: TranscriptIngestionInput,
+        export_format: str,
+        output_path: str | None,
+        max_nodes: int,
+    ) -> dict[str, Any] | None:
+        """Export a session-scoped context bundle after ingestion, if nodes exist."""
+        stats = self.get_stats()
+        if stats.total_nodes == 0:
+            return None
+        exported = self.export_context_bundle(
+            mode="prime",
+            query="",
+            project=payload.project,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+            max_nodes=max_nodes,
+            max_depth=2,
+            retrieval_mode="graph",
+            format=export_format,
+            output_path=output_path,
+            include_edges=True,
+            include_timestamps=True,
+            include_source_prompt=False,
+            audience="llm",
+        )
+        return {
+            "markdown_path": exported.markdown_path,
+            "json_path": exported.json_path,
+            "node_count": exported.node_count,
+            "edge_count": exported.edge_count,
+        }
 
     def graph_diff(self, *, since: str = "24h") -> GraphDiffResult:
         cutoff = parse_since_value(since)
@@ -2849,7 +3208,8 @@ class MemoryGraph:
             """,
             (self.tenant_id, session_id),
         ).fetchone()
-        return int(row["max_turn_index"] or -1) + 1
+        max_turn_index = row["max_turn_index"]
+        return int(-1 if max_turn_index is None else max_turn_index) + 1
 
     def _store_transcript_record(
         self,
@@ -2863,7 +3223,9 @@ class MemoryGraph:
         role: str,
         transcript_text: str,
         metadata: dict[str, Any] | None = None,
-    ) -> TranscriptRecord:
+        message_identity: str | None = None,
+    ) -> bool:
+        """Insert a transcript record.  Returns True if written, False if skipped (dedup)."""
         record = TranscriptRecord(
             tenant_id=self.tenant_id,
             agent_id=agent_id,
@@ -2876,12 +3238,13 @@ class MemoryGraph:
             metadata=metadata or {},
         )
         embedding = self.embedding_model.embed(record.transcript_text)
-        connection.execute(
+        cursor = connection.execute(
             """
-            INSERT INTO transcript_records (
-                id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text, embedding, metadata
+            INSERT OR IGNORE INTO transcript_records (
+                id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role,
+                transcript_text, embedding, metadata, message_identity
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -2895,9 +3258,10 @@ class MemoryGraph:
                 record.transcript_text,
                 self.embedding_model.to_bytes(embedding),
                 _encode_metadata(record.metadata),
+                message_identity,
             ),
         )
-        return record
+        return cursor.rowcount > 0
 
     def _upsert_vault_document(
         self,
@@ -3228,6 +3592,15 @@ class MemoryGraph:
                     candidate_nodes,
                     key=lambda node: (-topic_scores.get(node.id, 0.0), node.label.lower()),
                 )[: max_nodes * 2]
+            else:
+                best_topic_score = max(topic_scores.get(node.id, 0.0) for node in topical_nodes)
+                narrowed_topical_nodes = [
+                    node
+                    for node in topical_nodes
+                    if topic_scores.get(node.id, 0.0) >= best_topic_score - TEMPORAL_TOPIC_MARGIN
+                ]
+                if narrowed_topical_nodes:
+                    topical_nodes = narrowed_topical_nodes
             if temporal_hints.recency_mode == "latest":
                 return sorted(
                     topical_nodes,

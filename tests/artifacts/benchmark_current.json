@@ -192,12 +192,12 @@
     "systems": {
       "waggle": {
         "case_count": 120,
-        "hit_at_k": 0.9083333333333333,
-        "exact_support": 0.875,
+        "hit_at_k": 0.925,
+        "exact_support": 0.8416666666666667,
         "context_tokens": {
-          "mean": 63.00833333333333,
+          "mean": 59.05833333333333,
           "median": 49.0,
-          "p95": 121.0
+          "p95": 116.1
         },
         "by_task_family": {
           "adversarial_paraphrase": {
@@ -207,8 +207,8 @@
           },
           "cross_scenario_synthesis": {
             "case_count": 15,
-            "hit_at_k": 1.0,
-            "exact_support": 0.8
+            "hit_at_k": 0.9333333333333333,
+            "exact_support": 0.4
           },
           "decision_delta": {
             "case_count": 7,
@@ -217,18 +217,18 @@
           },
           "factual_recall": {
             "case_count": 18,
-            "hit_at_k": 0.8333333333333334,
-            "exact_support": 0.8333333333333334
+            "hit_at_k": 1.0,
+            "exact_support": 1.0
           },
           "implicit_reference": {
             "case_count": 13,
-            "hit_at_k": 0.9230769230769231,
-            "exact_support": 0.9230769230769231
+            "hit_at_k": 0.8461538461538461,
+            "exact_support": 0.8461538461538461
           },
           "multi_session_change": {
             "case_count": 14,
             "hit_at_k": 1.0,
-            "exact_support": 0.9285714285714286
+            "exact_support": 0.8571428571428571
           },
           "negation": {
             "case_count": 18,
@@ -237,8 +237,8 @@
           },
           "temporal_latest": {
             "case_count": 9,
-            "hit_at_k": 0.7777777777777778,
-            "exact_support": 0.7777777777777778
+            "hit_at_k": 0.8888888888888888,
+            "exact_support": 0.8888888888888888
           },
           "temporal_original": {
             "case_count": 20,
@@ -250,8 +250,8 @@
         "by_retrieval_mode": {
           "flat": {
             "case_count": 78,
-            "hit_at_k": 0.8717948717948718,
-            "exact_support": 0.8717948717948718,
+            "hit_at_k": 0.9102564102564102,
+            "exact_support": 0.9102564102564102,
             "max_depths": [
               0
             ],
@@ -265,8 +265,8 @@
           },
           "graph": {
             "case_count": 42,
-            "hit_at_k": 0.9761904761904762,
-            "exact_support": 0.8809523809523809,
+            "hit_at_k": 0.9523809523809523,
+            "exact_support": 0.7142857142857143,
             "max_depths": [
               1,
               2
@@ -401,7 +401,7 @@
         "hit_at_k": 0.95,
         "exact_support": 0.9333333333333333,
         "context_tokens": {
-          "mean": 259.6166666666667,
+          "mean": 259.64166666666665,
           "median": 259.0,
           "p95": 289.25
         },
@@ -486,7 +486,7 @@
         "task_family": "temporal_original",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 37,
+        "context_tokens": 27,
         "retrieved_ids": [
           "db_sqlite_local"
         ],
@@ -521,10 +521,12 @@
         "query_id": "q04",
         "system": "waggle",
         "task_family": "temporal_latest",
-        "hit_at_k": false,
-        "exact_support": false,
-        "context_tokens": 22,
-        "retrieved_ids": [],
+        "hit_at_k": true,
+        "exact_support": true,
+        "context_tokens": 24,
+        "retrieved_ids": [
+          "auth_jwt_1h"
+        ],
         "gold_support_ids": [
           "auth_jwt_1h"
         ],
@@ -572,11 +574,11 @@
         "query_id": "q07",
         "system": "waggle",
         "task_family": "factual_recall",
-        "hit_at_k": false,
-        "exact_support": false,
-        "context_tokens": 42,
+        "hit_at_k": true,
+        "exact_support": true,
+        "context_tokens": 39,
         "retrieved_ids": [
-          "cache_redis_sessions"
+          "cache_keydb_sessions"
         ],
         "gold_support_ids": [
           "cache_keydb_sessions"
@@ -591,7 +593,7 @@
         "task_family": "temporal_original",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 42,
+        "context_tokens": 47,
         "retrieved_ids": [
           "cache_redis_sessions"
         ],
@@ -608,10 +610,10 @@
         "task_family": "multi_session_change",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 81,
+        "context_tokens": 107,
         "retrieved_ids": [
-          "cache_redis_sessions",
-          "cache_keydb_sessions"
+          "cache_keydb_sessions",
+          "cache_redis_sessions"
         ],
         "gold_support_ids": [
           "cache_redis_sessions",
@@ -627,7 +629,7 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 48,
+        "context_tokens": 24,
         "retrieved_ids": [
           "search_opensearch"
         ],
@@ -681,10 +683,9 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 36,
+        "context_tokens": 24,
         "retrieved_ids": [
-          "frontend_nextjs",
-          "frontend_react_spa"
+          "frontend_nextjs"
         ],
         "gold_support_ids": [
           "frontend_nextjs"
@@ -701,8 +702,7 @@
         "exact_support": true,
         "context_tokens": 31,
         "retrieved_ids": [
-          "frontend_react_spa",
-          "queue_celery_redis"
+          "frontend_react_spa"
         ],
         "gold_support_ids": [
           "frontend_react_spa"
@@ -736,10 +736,9 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 40,
+        "context_tokens": 51,
         "retrieved_ids": [
-          "analytics_streaming",
-          "analytics_batch"
+          "analytics_streaming"
         ],
         "gold_support_ids": [
           "analytics_streaming"
@@ -899,10 +898,12 @@
         "query_id": "q25",
         "system": "waggle",
         "task_family": "factual_recall",
-        "hit_at_k": false,
-        "exact_support": false,
-        "context_tokens": 44,
-        "retrieved_ids": [],
+        "hit_at_k": true,
+        "exact_support": true,
+        "context_tokens": 20,
+        "retrieved_ids": [
+          "deploy_cloud_run"
+        ],
         "gold_support_ids": [
           "deploy_cloud_run"
         ],
@@ -935,8 +936,8 @@
         "exact_support": true,
         "context_tokens": 105,
         "retrieved_ids": [
-          "deploy_ecs",
-          "deploy_cloud_run"
+          "deploy_cloud_run",
+          "deploy_ecs"
         ],
         "gold_support_ids": [
           "deploy_ecs",
@@ -1007,10 +1008,9 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 42,
+        "context_tokens": 27,
         "retrieved_ids": [
-          "access_rbac_abac",
-          "access_rbac_only"
+          "access_rbac_abac"
         ],
         "gold_support_ids": [
           "access_rbac_abac"
@@ -1027,8 +1027,8 @@
         "exact_support": true,
         "context_tokens": 42,
         "retrieved_ids": [
-          "access_rbac_abac",
-          "access_rbac_only"
+          "access_rbac_only",
+          "access_rbac_abac"
         ],
         "gold_support_ids": [
           "access_rbac_only"
@@ -1080,10 +1080,9 @@
         "task_family": "temporal_original",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 36,
+        "context_tokens": 17,
         "retrieved_ids": [
-          "mobile_no_offline",
-          "mobile_offline_queue"
+          "mobile_no_offline"
         ],
         "gold_support_ids": [
           "mobile_no_offline"
@@ -1098,7 +1097,7 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 45,
+        "context_tokens": 23,
         "retrieved_ids": [
           "export_csv_parquet"
         ],
@@ -1113,11 +1112,11 @@
         "query_id": "q37",
         "system": "waggle",
         "task_family": "temporal_original",
-        "hit_at_k": false,
-        "exact_support": false,
-        "context_tokens": 44,
+        "hit_at_k": true,
+        "exact_support": true,
+        "context_tokens": 35,
         "retrieved_ids": [
-          "export_csv_parquet"
+          "export_csv_only"
         ],
         "gold_support_ids": [
           "export_csv_only"
@@ -1132,10 +1131,9 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 39,
+        "context_tokens": 23,
         "retrieved_ids": [
-          "incident_autorollback_5xx",
-          "incident_no_autorollback"
+          "incident_autorollback_5xx"
         ],
         "gold_support_ids": [
           "incident_autorollback_5xx"
@@ -1148,11 +1146,11 @@
         "query_id": "q39",
         "system": "waggle",
         "task_family": "temporal_original",
-        "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 39,
+        "hit_at_k": false,
+        "exact_support": false,
+        "context_tokens": 42,
         "retrieved_ids": [
-          "incident_no_autorollback"
+          "deploy_ecs"
         ],
         "gold_support_ids": [
           "incident_no_autorollback"
@@ -1167,10 +1165,9 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 33,
+        "context_tokens": 19,
         "retrieved_ids": [
-          "retention_audit_90d",
-          "retention_logs_30d"
+          "retention_audit_90d"
         ],
         "gold_support_ids": [
           "retention_audit_90d"
@@ -1185,10 +1182,9 @@
         "task_family": "temporal_original",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 33,
+        "context_tokens": 15,
         "retrieved_ids": [
-          "retention_logs_30d",
-          "retention_audit_90d"
+          "retention_logs_30d"
         ],
         "gold_support_ids": [
           "retention_logs_30d"
@@ -1201,11 +1197,11 @@
         "query_id": "q42",
         "system": "waggle",
         "task_family": "factual_recall",
-        "hit_at_k": false,
-        "exact_support": false,
-        "context_tokens": 40,
+        "hit_at_k": true,
+        "exact_support": true,
+        "context_tokens": 46,
         "retrieved_ids": [
-          "queue_celery_redis"
+          "queue_temporal"
         ],
         "gold_support_ids": [
           "queue_temporal"
@@ -1256,8 +1252,8 @@
         "exact_support": true,
         "context_tokens": 37,
         "retrieved_ids": [
-          "schema_manual",
-          "schema_alembic"
+          "schema_alembic",
+          "schema_manual"
         ],
         "gold_support_ids": [
           "schema_manual"
@@ -1342,9 +1338,8 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 34,
+        "context_tokens": 20,
         "retrieved_ids": [
-          "sync_polling",
           "sync_webhooks_fallback"
         ],
         "gold_support_ids": [
@@ -1360,12 +1355,12 @@
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
         "exact_support": false,
-        "context_tokens": 107,
+        "context_tokens": 103,
         "retrieved_ids": [
-          "deploy_cloud_run",
-          "ctx_postgres_new",
-          "incident_autorollback_5xx",
-          "db_sqlite_local"
+          "db_postgres_prod",
+          "db_sqlite_local",
+          "search_pg_trigram",
+          "queue_celery_redis"
         ],
         "gold_support_ids": [
           "db_postgres_prod",
@@ -1380,11 +1375,10 @@
         "system": "waggle",
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 69,
+        "exact_support": false,
+        "context_tokens": 50,
         "retrieved_ids": [
           "auth_jwt_1h",
-          "mobile_offline_queue",
           "auth_jwt_15m"
         ],
         "gold_support_ids": [
@@ -1403,8 +1397,8 @@
         "exact_support": true,
         "context_tokens": 105,
         "retrieved_ids": [
-          "incident_autorollback_5xx",
           "obs_traces_slos",
+          "incident_autorollback_5xx",
           "ctx_postgres_new",
           "incident_no_autorollback"
         ],
@@ -1421,11 +1415,11 @@
         "system": "waggle",
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 107,
+        "exact_support": false,
+        "context_tokens": 86,
         "retrieved_ids": [
-          "ingest_ndjson",
-          "export_csv_parquet"
+          "export_csv_parquet",
+          "storage_s3_tiering"
         ],
         "gold_support_ids": [
           "ingest_ndjson",
@@ -1440,12 +1434,12 @@
         "system": "waggle",
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 127,
+        "exact_support": false,
+        "context_tokens": 110,
         "retrieved_ids": [
-          "queue_temporal",
           "schema_alembic",
-          "ctx_postgres_new"
+          "schema_manual",
+          "incident_no_autorollback"
         ],
         "gold_support_ids": [
           "queue_temporal",
@@ -1464,8 +1458,8 @@
         "context_tokens": 83,
         "retrieved_ids": [
           "retention_audit_90d",
-          "export_csv_parquet",
-          "storage_s3_tiering"
+          "storage_s3_tiering",
+          "export_csv_parquet"
         ],
         "gold_support_ids": [
           "storage_s3_tiering",
@@ -1483,9 +1477,9 @@
         "exact_support": true,
         "context_tokens": 115,
         "retrieved_ids": [
-          "flags_env_vars",
           "access_rbac_abac",
-          "flags_control_plane"
+          "flags_control_plane",
+          "flags_env_vars"
         ],
         "gold_support_ids": [
           "flags_control_plane",
@@ -1500,10 +1494,9 @@
         "system": "waggle",
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 94,
+        "exact_support": false,
+        "context_tokens": 49,
         "retrieved_ids": [
-          "sync_webhooks_fallback",
           "notify_email_slack"
         ],
         "gold_support_ids": [
@@ -1524,9 +1517,9 @@
         "retrieved_ids": [
           "ctx_postgres_new",
           "search_pg_trigram",
-          "queue_celery_redis",
           "db_postgres_prod",
-          "db_sqlite_local"
+          "db_sqlite_local",
+          "queue_celery_redis"
         ],
         "gold_support_ids": [
           "db_postgres_prod"
@@ -1597,12 +1590,12 @@
         "task_family": "decision_delta",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 100,
+        "context_tokens": 108,
         "retrieved_ids": [
           "search_pg_trigram",
-          "auth_jwt_15m",
           "search_opensearch",
-          "queue_celery_redis"
+          "queue_celery_redis",
+          "queue_temporal"
         ],
         "gold_support_ids": [
           "search_pg_trigram",
@@ -1657,12 +1650,13 @@
         "task_family": "decision_delta",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 106,
+        "context_tokens": 109,
         "retrieved_ids": [
           "queue_celery_redis",
-          "ctx_postgres_new",
           "queue_temporal",
-          "search_pg_trigram"
+          "search_pg_trigram",
+          "ctx_postgres_new",
+          "db_postgres_prod"
         ],
         "gold_support_ids": [
           "queue_celery_redis",
@@ -1676,11 +1670,10 @@
         "query_id": "q67",
         "system": "waggle",
         "task_family": "cross_scenario_synthesis",
-        "hit_at_k": true,
+        "hit_at_k": false,
         "exact_support": false,
-        "context_tokens": 108,
+        "context_tokens": 113,
         "retrieved_ids": [
-          "ctx_postgres_decision",
           "ctx_postgres_new",
           "db_postgres_prod",
           "db_sqlite_local"
@@ -1699,11 +1692,12 @@
         "task_family": "multi_session_change",
         "hit_at_k": true,
         "exact_support": false,
-        "context_tokens": 124,
+        "context_tokens": 116,
         "retrieved_ids": [
           "ctx_concurrency_reason",
           "ctx_postgres_new",
-          "db_postgres_prod"
+          "db_postgres_prod",
+          "search_pg_trigram"
         ],
         "gold_support_ids": [
           "ctx_sqlite_old",
@@ -1796,10 +1790,10 @@
         "exact_support": true,
         "context_tokens": 100,
         "retrieved_ids": [
-          "sec_no_raw_api_keys",
           "sec_breakglass_audited",
           "retention_audit_90d",
-          "deploy_cloud_run"
+          "deploy_cloud_run",
+          "sec_no_raw_api_keys"
         ],
         "gold_support_ids": [
           "sec_no_raw_api_keys",
@@ -1834,8 +1828,8 @@
         "exact_support": true,
         "context_tokens": 46,
         "retrieved_ids": [
-          "risk_rules_engine_refunds",
-          "risk_manual_high_value_refunds"
+          "risk_manual_high_value_refunds",
+          "risk_rules_engine_refunds"
         ],
         "gold_support_ids": [
           "risk_manual_high_value_refunds"
@@ -1867,14 +1861,14 @@
         "system": "waggle",
         "task_family": "multi_session_change",
         "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 111,
+        "exact_support": false,
+        "context_tokens": 102,
         "retrieved_ids": [
           "risk_manual_high_value_refunds",
           "risk_rules_engine_refunds",
           "incident_no_autorollback",
           "incident_autorollback_5xx",
-          "risk_no_one_click_refunds"
+          "flags_env_vars"
         ],
         "gold_support_ids": [
           "risk_manual_high_value_refunds",
@@ -1909,10 +1903,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 49,
+        "context_tokens": 27,
         "retrieved_ids": [
-          "privacy_enterprise_approval",
-          "export_csv_parquet"
+          "privacy_enterprise_approval"
         ],
         "gold_support_ids": [
           "privacy_enterprise_approval"
@@ -1949,10 +1942,9 @@
         "task_family": "implicit_reference",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 49,
+        "context_tokens": 27,
         "retrieved_ids": [
-          "privacy_enterprise_approval",
-          "export_csv_parquet"
+          "privacy_enterprise_approval"
         ],
         "gold_support_ids": [
           "privacy_enterprise_approval"
@@ -2076,14 +2068,11 @@
         "system": "waggle",
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 108,
+        "exact_support": false,
+        "context_tokens": 51,
         "retrieved_ids": [
-          "region_canada_first",
-          "region_no_brazil_payments",
           "region_brazil_after_cert",
-          "billing_paddle",
-          "billing_stripe"
+          "region_no_brazil_payments"
         ],
         "gold_support_ids": [
           "region_canada_first",
@@ -2119,9 +2108,9 @@
         "exact_support": true,
         "context_tokens": 122,
         "retrieved_ids": [
-          "export_csv_parquet",
-          "ml_pm_approval_gate",
           "privacy_enterprise_approval",
+          "ml_pm_approval_gate",
+          "export_csv_parquet",
           "privacy_signed_export_links"
         ],
         "gold_support_ids": [
@@ -2137,13 +2126,11 @@
         "system": "waggle",
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 121,
+        "exact_support": false,
+        "context_tokens": 72,
         "retrieved_ids": [
-          "sec_no_shared_admins",
           "privacy_enterprise_approval",
-          "ml_pm_approval_gate",
-          "sec_breakglass_audited"
+          "privacy_signed_export_links"
         ],
         "gold_support_ids": [
           "sec_breakglass_audited",
@@ -2159,10 +2146,9 @@
         "task_family": "cross_scenario_synthesis",
         "hit_at_k": true,
         "exact_support": false,
-        "context_tokens": 107,
+        "context_tokens": 122,
         "retrieved_ids": [
           "risk_rules_engine_refunds",
-          "deploy_cloud_run",
           "incident_no_autorollback",
           "risk_manual_high_value_refunds",
           "risk_no_one_click_refunds"
@@ -2198,10 +2184,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 49,
+        "context_tokens": 45,
         "retrieved_ids": [
-          "privacy_enterprise_approval",
-          "export_csv_parquet"
+          "privacy_enterprise_approval"
         ],
         "gold_support_ids": [
           "privacy_enterprise_approval"
@@ -2233,12 +2218,11 @@
         "task_family": "decision_delta",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 97,
+        "context_tokens": 72,
         "retrieved_ids": [
-          "risk_manual_high_value_refunds",
           "risk_rules_engine_refunds",
-          "incident_no_autorollback",
-          "risk_no_one_click_refunds"
+          "risk_no_one_click_refunds",
+          "risk_manual_high_value_refunds"
         ],
         "gold_support_ids": [
           "risk_manual_high_value_refunds",
@@ -2254,12 +2238,12 @@
         "task_family": "decision_delta",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 122,
+        "context_tokens": 116,
         "retrieved_ids": [
           "ml_no_auto_promote",
           "ml_pm_approval_gate",
-          "ml_eval_canary_required",
-          "privacy_enterprise_approval"
+          "privacy_no_email_exports",
+          "ml_eval_canary_required"
         ],
         "gold_support_ids": [
           "ml_no_auto_promote",
@@ -2297,8 +2281,8 @@
         "context_tokens": 120,
         "retrieved_ids": [
           "privacy_enterprise_approval",
-          "export_csv_parquet",
-          "privacy_signed_export_links"
+          "privacy_signed_export_links",
+          "export_csv_parquet"
         ],
         "gold_support_ids": [
           "privacy_signed_export_links",
@@ -2312,11 +2296,10 @@
         "query_id": "q100",
         "system": "waggle",
         "task_family": "implicit_reference",
-        "hit_at_k": true,
-        "exact_support": true,
-        "context_tokens": 51,
+        "hit_at_k": false,
+        "exact_support": false,
+        "context_tokens": 23,
         "retrieved_ids": [
-          "region_brazil_after_cert",
           "region_no_brazil_payments"
         ],
         "gold_support_ids": [
@@ -2591,8 +2574,9 @@
         "task_family": "negation",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 91,
+        "context_tokens": 69,
         "retrieved_ids": [
+          "ml_pm_approval_gate",
           "ml_no_auto_promote"
         ],
         "gold_support_ids": [
@@ -5340,16 +5324,16 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 254,
+        "context_tokens": 257,
         "retrieved_ids": [
-          "auth_jwt_15m",
           "auth_jwt_1h",
+          "auth_jwt_15m",
           "retention_audit_90d",
           "retention_logs_30d",
           "privacy_signed_export_links",
           "privacy_enterprise_approval",
           "incident_autorollback_5xx",
-          "notify_email_only"
+          "ml_pm_approval_gate"
         ],
         "gold_support_ids": [
           "auth_jwt_1h"
@@ -5445,8 +5429,8 @@
           "frontend_nextjs",
           "queue_celery_redis",
           "storage_s3_standard",
-          "queue_temporal",
-          "sync_polling"
+          "sync_polling",
+          "queue_temporal"
         ],
         "gold_support_ids": [
           "cache_redis_sessions"
@@ -5493,8 +5477,8 @@
           "docs_bm25",
           "search_pg_trigram",
           "ctx_sqlite_old",
-          "db_sqlite_local",
           "db_postgres_prod",
+          "db_sqlite_local",
           "ctx_postgres_new",
           "ctx_concurrency_reason"
         ],
@@ -5573,9 +5557,9 @@
           "ctx_postgres_decision",
           "ctx_acid_reason",
           "queue_temporal",
-          "queue_celery_redis",
           "ctx_postgres_new",
           "ctx_concurrency_reason",
+          "queue_celery_redis",
           "analytics_streaming"
         ],
         "gold_support_ids": [
@@ -5646,11 +5630,11 @@
           "analytics_batch",
           "ctx_postgres_decision",
           "ctx_acid_reason",
-          "db_postgres_prod",
           "obs_traces_slos",
+          "db_postgres_prod",
           "queue_temporal",
           "export_csv_parquet",
-          "queue_celery_redis"
+          "onboarding_wizard"
         ],
         "gold_support_ids": [
           "analytics_streaming"
@@ -5665,7 +5649,7 @@
         "task_family": "temporal_original",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 234,
+        "context_tokens": 226,
         "retrieved_ids": [
           "analytics_batch",
           "analytics_streaming",
@@ -5674,7 +5658,7 @@
           "obs_traces_slos",
           "obs_logs_only",
           "billing_stripe",
-          "onboarding_wizard"
+          "retention_logs_30d"
         ],
         "gold_support_ids": [
           "analytics_batch"
@@ -5791,7 +5775,7 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 243,
+        "context_tokens": 241,
         "retrieved_ids": [
           "billing_stripe",
           "billing_paddle",
@@ -5800,7 +5784,7 @@
           "region_brazil_after_cert",
           "support_manual_bh",
           "access_rbac_abac",
-          "queue_celery_redis"
+          "mobile_offline_queue"
         ],
         "gold_support_ids": [
           "billing_paddle"
@@ -5866,14 +5850,14 @@
         "exact_support": true,
         "context_tokens": 251,
         "retrieved_ids": [
-          "deploy_ecs",
           "deploy_cloud_run",
+          "deploy_ecs",
           "sec_no_raw_api_keys",
           "incident_no_autorollback",
           "schema_manual",
+          "flags_control_plane",
           "frontend_nextjs",
-          "db_postgres_prod",
-          "flags_control_plane"
+          "db_postgres_prod"
         ],
         "gold_support_ids": [
           "deploy_cloud_run"
@@ -6017,8 +6001,8 @@
           "sec_breakglass_audited",
           "ml_eval_canary_required",
           "privacy_enterprise_approval",
-          "ctx_sqlite_old",
           "queue_temporal",
+          "ctx_sqlite_old",
           "onboarding_wizard"
         ],
         "gold_support_ids": [
@@ -6042,8 +6026,8 @@
           "ml_eval_canary_required",
           "onboarding_wizard",
           "obs_traces_slos",
-          "privacy_enterprise_approval",
-          "docs_algolia"
+          "docs_algolia",
+          "privacy_enterprise_approval"
         ],
         "gold_support_ids": [
           "access_rbac_only"
@@ -6139,8 +6123,8 @@
           "privacy_signed_export_links",
           "privacy_no_email_exports",
           "ingest_ndjson",
-          "db_postgres_prod",
-          "billing_paddle"
+          "billing_paddle",
+          "db_postgres_prod"
         ],
         "gold_support_ids": [
           "export_csv_parquet"
@@ -6179,7 +6163,7 @@
         "task_family": "factual_recall",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 229,
+        "context_tokens": 242,
         "retrieved_ids": [
           "incident_no_autorollback",
           "incident_autorollback_5xx",
@@ -6187,8 +6171,8 @@
           "deploy_cloud_run",
           "queue_temporal",
           "schema_manual",
-          "deploy_ecs",
-          "retention_logs_30d"
+          "retention_audit_90d",
+          "ml_pm_approval_gate"
         ],
         "gold_support_ids": [
           "incident_autorollback_5xx"
@@ -6208,8 +6192,8 @@
           "incident_no_autorollback",
           "incident_autorollback_5xx",
           "schema_manual",
-          "deploy_cloud_run",
           "deploy_ecs",
+          "deploy_cloud_run",
           "region_canada_first",
           "retention_logs_30d",
           "mobile_no_offline"
@@ -6251,7 +6235,7 @@
         "task_family": "temporal_original",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 231,
+        "context_tokens": 228,
         "retrieved_ids": [
           "retention_logs_30d",
           "retention_audit_90d",
@@ -6260,7 +6244,7 @@
           "sec_no_raw_api_keys",
           "auth_jwt_1h",
           "incident_autorollback_5xx",
-          "cache_keydb_sessions"
+          "analytics_batch"
         ],
         "gold_support_ids": [
           "retention_logs_30d"
@@ -6479,10 +6463,10 @@
           "mobile_offline_queue",
           "sync_polling",
           "queue_temporal",
+          "storage_s3_tiering",
           "ctx_fastapi_decision",
           "ctx_realtime_req",
           "ctx_concurrency_fact",
-          "storage_s3_tiering",
           "obs_traces_slos",
           "export_csv_parquet"
         ],
@@ -6507,9 +6491,9 @@
           "ctx_concurrency_reason",
           "db_sqlite_local",
           "obs_traces_slos",
+          "export_csv_parquet",
           "ctx_postgres_decision",
           "ctx_acid_reason",
-          "export_csv_parquet",
           "deploy_cloud_run"
         ],
         "gold_support_ids": [
@@ -6583,8 +6567,8 @@
           "analytics_streaming",
           "ingest_ndjson",
           "db_postgres_prod",
-          "export_csv_only",
           "ingest_csv",
+          "export_csv_only",
           "ctx_postgres_decision",
           "ctx_acid_reason",
           "queue_temporal"
@@ -7118,8 +7102,8 @@
           "risk_manual_high_value_refunds",
           "risk_rules_engine_refunds",
           "risk_no_one_click_refunds",
-          "schema_alembic",
           "sec_no_shared_admins",
+          "schema_alembic",
           "docs_bm25",
           "sec_breakglass_audited",
           "retention_audit_90d"
@@ -7265,8 +7249,8 @@
         "retrieved_ids": [
           "privacy_enterprise_approval",
           "export_csv_only",
-          "privacy_no_email_exports",
           "privacy_signed_export_links",
+          "privacy_no_email_exports",
           "db_postgres_prod",
           "export_csv_parquet",
           "billing_paddle",
@@ -7439,8 +7423,8 @@
           "schema_alembic",
           "access_rbac_abac",
           "privacy_enterprise_approval",
-          "support_manual_bh",
-          "incident_autorollback_5xx"
+          "incident_autorollback_5xx",
+          "support_manual_bh"
         ],
         "gold_support_ids": [
           "region_canada_first",
@@ -8246,9 +8230,9 @@
         "hit_at_k": 0.975,
         "exact_support": 0.975,
         "context_tokens": {
-          "mean": 39.675,
-          "median": 39.0,
-          "p95": 52.29999999999998
+          "mean": 35.5,
+          "median": 37.0,
+          "p95": 49.0
         },
         "by_task_family": {
           "adversarial_paraphrase": {
@@ -8474,9 +8458,9 @@
         "hit_at_k": 1.0,
         "exact_support": 1.0,
         "context_tokens": {
-          "mean": 74.325,
-          "median": 86.0,
-          "p95": 110.49999999999997
+          "mean": 61.9,
+          "median": 54.0,
+          "p95": 110.0
         },
         "by_task_family": {
           "adversarial_paraphrase": {
@@ -8813,10 +8797,9 @@
         "task_family": "adversarial_paraphrase",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 52,
+        "context_tokens": 39,
         "retrieved_ids": [
           "mobile_offline_queue",
-          "sync_polling",
           "sync_webhooks_fallback"
         ],
         "gold_support_ids": [
@@ -8868,10 +8851,9 @@
         "task_family": "adversarial_paraphrase",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 64,
+        "context_tokens": 38,
         "retrieved_ids": [
           "flags_env_vars",
-          "access_rbac_abac",
           "flags_control_plane"
         ],
         "gold_support_ids": [
@@ -8905,10 +8887,9 @@
         "task_family": "adversarial_paraphrase",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 58,
+        "context_tokens": 41,
         "retrieved_ids": [
           "queue_celery_redis",
-          "flags_env_vars",
           "queue_temporal"
         ],
         "gold_support_ids": [
@@ -9070,8 +9051,8 @@
         "exact_support": true,
         "context_tokens": 50,
         "retrieved_ids": [
-          "ctx_postgres_new",
-          "db_postgres_prod"
+          "db_postgres_prod",
+          "ctx_postgres_new"
         ],
         "gold_support_ids": [
           "db_postgres_prod"
@@ -9122,10 +9103,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 42,
+        "context_tokens": 24,
         "retrieved_ids": [
-          "search_opensearch",
-          "search_pg_trigram"
+          "search_opensearch"
         ],
         "gold_support_ids": [
           "search_opensearch"
@@ -9196,8 +9176,8 @@
         "exact_support": true,
         "context_tokens": 33,
         "retrieved_ids": [
-          "billing_paddle",
-          "billing_stripe"
+          "billing_stripe",
+          "billing_paddle"
         ],
         "gold_support_ids": [
           "billing_paddle"
@@ -9212,10 +9192,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 41,
+        "context_tokens": 20,
         "retrieved_ids": [
-          "deploy_cloud_run",
-          "deploy_ecs"
+          "deploy_cloud_run"
         ],
         "gold_support_ids": [
           "deploy_cloud_run"
@@ -9248,10 +9227,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 42,
+        "context_tokens": 27,
         "retrieved_ids": [
-          "access_rbac_abac",
-          "access_rbac_only"
+          "access_rbac_abac"
         ],
         "gold_support_ids": [
           "access_rbac_abac"
@@ -9266,10 +9244,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 36,
+        "context_tokens": 19,
         "retrieved_ids": [
-          "mobile_offline_queue",
-          "mobile_no_offline"
+          "mobile_offline_queue"
         ],
         "gold_support_ids": [
           "mobile_offline_queue"
@@ -9284,9 +9261,8 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 49,
+        "context_tokens": 23,
         "retrieved_ids": [
-          "privacy_enterprise_approval",
           "export_csv_parquet"
         ],
         "gold_support_ids": [
@@ -9410,10 +9386,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 34,
+        "context_tokens": 20,
         "retrieved_ids": [
-          "sync_webhooks_fallback",
-          "sync_polling"
+          "sync_webhooks_fallback"
         ],
         "gold_support_ids": [
           "sync_webhooks_fallback"
@@ -9547,13 +9522,11 @@
         "task_family": "adversarial_paraphrase",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 91,
+        "context_tokens": 56,
         "retrieved_ids": [
           "mobile_offline_queue",
-          "sync_polling",
           "sync_webhooks_fallback",
-          "incident_autorollback_5xx",
-          "incident_no_autorollback"
+          "mobile_no_offline"
         ],
         "gold_support_ids": [
           "mobile_offline_queue"
@@ -9608,10 +9581,9 @@
         "task_family": "adversarial_paraphrase",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 80,
+        "context_tokens": 54,
         "retrieved_ids": [
           "flags_env_vars",
-          "access_rbac_abac",
           "flags_control_plane",
           "incident_no_autorollback"
         ],
@@ -9630,8 +9602,8 @@
         "exact_support": true,
         "context_tokens": 120,
         "retrieved_ids": [
-          "privacy_enterprise_approval",
           "export_csv_parquet",
+          "privacy_enterprise_approval",
           "privacy_signed_export_links",
           "storage_s3_tiering",
           "ml_pm_approval_gate"
@@ -9649,13 +9621,13 @@
         "task_family": "adversarial_paraphrase",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 107,
+        "context_tokens": 99,
         "retrieved_ids": [
           "queue_celery_redis",
-          "flags_env_vars",
-          "queue_temporal",
-          "incident_autorollback_5xx",
-          "ctx_postgres_new"
+          "db_sqlite_local",
+          "search_pg_trigram",
+          "db_postgres_prod",
+          "queue_temporal"
         ],
         "gold_support_ids": [
           "queue_temporal"
@@ -9767,13 +9739,11 @@
         "task_family": "adversarial_paraphrase",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 95,
+        "context_tokens": 60,
         "retrieved_ids": [
           "incident_autorollback_5xx",
           "incident_no_autorollback",
-          "ctx_postgres_new",
-          "sync_polling",
-          "flags_env_vars"
+          "ml_no_auto_promote"
         ],
         "gold_support_ids": [
           "incident_autorollback_5xx"
@@ -9810,8 +9780,8 @@
         "retrieved_ids": [
           "export_csv_parquet",
           "storage_s3_tiering",
-          "incident_autorollback_5xx",
           "incident_no_autorollback",
+          "incident_autorollback_5xx",
           "ingest_csv"
         ],
         "gold_support_ids": [
@@ -9827,13 +9797,13 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 105,
+        "context_tokens": 98,
         "retrieved_ids": [
-          "ctx_postgres_new",
           "db_postgres_prod",
           "db_sqlite_local",
-          "ctx_postgres_decision",
-          "search_pg_trigram"
+          "search_pg_trigram",
+          "queue_celery_redis",
+          "ctx_postgres_decision"
         ],
         "gold_support_ids": [
           "db_postgres_prod"
@@ -9850,8 +9820,8 @@
         "exact_support": true,
         "context_tokens": 29,
         "retrieved_ids": [
-          "auth_jwt_15m",
-          "auth_jwt_1h"
+          "auth_jwt_1h",
+          "auth_jwt_15m"
         ],
         "gold_support_ids": [
           "auth_jwt_1h"
@@ -9868,8 +9838,8 @@
         "exact_support": true,
         "context_tokens": 41,
         "retrieved_ids": [
-          "cache_keydb_sessions",
-          "cache_redis_sessions"
+          "cache_redis_sessions",
+          "cache_keydb_sessions"
         ],
         "gold_support_ids": [
           "cache_keydb_sessions"
@@ -9884,13 +9854,10 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 107,
+        "context_tokens": 42,
         "retrieved_ids": [
-          "search_pg_trigram",
           "search_opensearch",
-          "db_postgres_prod",
-          "db_sqlite_local",
-          "ctx_postgres_new"
+          "search_pg_trigram"
         ],
         "gold_support_ids": [
           "search_opensearch"
@@ -9923,13 +9890,11 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 92,
+        "context_tokens": 56,
         "retrieved_ids": [
-          "analytics_streaming",
-          "incident_autorollback_5xx",
           "analytics_batch",
-          "incident_no_autorollback",
-          "sync_polling"
+          "analytics_streaming",
+          "incident_no_autorollback"
         ],
         "gold_support_ids": [
           "analytics_streaming"
@@ -9962,11 +9927,10 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 84,
+        "context_tokens": 55,
         "retrieved_ids": [
-          "billing_paddle",
-          "region_brazil_after_cert",
           "billing_stripe",
+          "billing_paddle",
           "region_no_brazil_payments"
         ],
         "gold_support_ids": [
@@ -10022,10 +9986,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 42,
+        "context_tokens": 27,
         "retrieved_ids": [
-          "access_rbac_abac",
-          "access_rbac_only"
+          "access_rbac_abac"
         ],
         "gold_support_ids": [
           "access_rbac_abac"
@@ -10058,13 +10021,10 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 120,
+        "context_tokens": 42,
         "retrieved_ids": [
           "export_csv_parquet",
-          "privacy_enterprise_approval",
-          "privacy_signed_export_links",
-          "storage_s3_tiering",
-          "ml_pm_approval_gate"
+          "storage_s3_tiering"
         ],
         "gold_support_ids": [
           "export_csv_parquet"
@@ -10079,13 +10039,13 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 104,
+        "context_tokens": 93,
         "retrieved_ids": [
-          "incident_no_autorollback",
           "incident_autorollback_5xx",
-          "ctx_postgres_new",
-          "storage_s3_standard",
-          "db_postgres_prod"
+          "incident_no_autorollback",
+          "ml_no_auto_promote",
+          "analytics_batch",
+          "docs_algolia"
         ],
         "gold_support_ids": [
           "incident_autorollback_5xx"
@@ -10121,13 +10081,10 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 109,
+        "context_tokens": 41,
         "retrieved_ids": [
           "queue_temporal",
-          "queue_celery_redis",
-          "ctx_postgres_new",
-          "db_postgres_prod",
-          "search_pg_trigram"
+          "queue_celery_redis"
         ],
         "gold_support_ids": [
           "queue_temporal"
@@ -10142,11 +10099,10 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 53,
+        "context_tokens": 37,
         "retrieved_ids": [
           "schema_alembic",
-          "schema_manual",
-          "incident_no_autorollback"
+          "schema_manual"
         ],
         "gold_support_ids": [
           "schema_alembic"
@@ -10198,13 +10154,9 @@
         "task_family": "temporal_latest",
         "hit_at_k": true,
         "exact_support": true,
-        "context_tokens": 88,
+        "context_tokens": 20,
         "retrieved_ids": [
-          "sync_webhooks_fallback",
-          "incident_autorollback_5xx",
-          "sync_polling",
-          "incident_no_autorollback",
-          "schema_manual"
+          "sync_webhooks_fallback"
         ],
         "gold_support_ids": [
           "sync_webhooks_fallback"

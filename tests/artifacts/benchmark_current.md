@@ -6,7 +6,7 @@
 
 | System | Hit@k | Exact support | Mean tokens | Median tokens | p95 tokens |
 |--------|-------|---------------|-------------|---------------|------------|
-| waggle | 91% | 88% | 63.0 | 49.0 | 121.0 |
+| waggle | 92% | 84% | 59.1 | 49.0 | 116.1 |
 | rag_naive | 94% | 91% | 161.8 | 159.0 | 184.1 |
 | rag_tuned | 95% | 93% | 259.6 | 259.0 | 289.2 |
 
@@ -19,8 +19,8 @@
 
 | Mode | Cases | Max depth | Hit@k | Exact support |
 |------|-------|-----------|-------|---------------|
-| flat | 78 | 0 | 87% | 87% |
-| graph | 42 | 1, 2 | 98% | 88% |
+| flat | 78 | 0 | 91% | 91% |
+| graph | 42 | 1, 2 | 95% | 71% |
 
 ## Failure Protocol
 
@@ -36,5 +36,5 @@
 
 | System | Hit@k | Exact support | Mean tokens |
 |--------|-------|---------------|-------------|
-| graph_raw | 98% | 98% | 39.7 |
-| graph_hybrid | 100% | 100% | 74.3 |
+| graph_raw | 98% | 98% | 35.5 |
+| graph_hybrid | 100% | 100% | 61.9 |

@@ -30,12 +30,13 @@
 
 ## What's New — v0.1.8
 
+- **Rollover transcript handoff CLI**: `waggle-mcp ingest-transcript-handoff` ingests full ordered transcripts, deduplicates them with `message_identity`, and exports a session-scoped handoff bundle for the next window or IDE.
+- **Cross-run completion fixes**: append-only reruns now avoid reprocessing already completed turns while still completing a previously trailing `user` block when the matching `assistant` arrives later.
+- **Evidence alignment fixes**: batch-ingested nodes now keep evidence turn indices aligned with the actual stored transcript rows, including tool/system-interleaved sessions.
+- **Export error contract hardening**: handoff export failures now surface as real CLI failures instead of being silently downgraded into `export_skipped`.
 - **Benchmark harness**: end-to-end `WaggleAdapter` connecting the graph engine to ConvoMem / MemBench runners with automated exact-match scoring and latency logging.
 - **LongMemEval integration**: CLI-driven retrieval evaluation against the official LongMemEval split (`97.4% R@5` / `88.2% Exact@5` in `graph_raw`, `96.4%` / `85.6%` in `graph_hybrid`).
-- **Logging utilities**: structured log helpers (`logging_utils`) for consistent, level-aware output across all subsystems.
-- **Evidence tracking**: new `evidence.py` module records source provenance on stored nodes so reasoning chains are fully traceable.
 - **Observability stack**: Grafana dashboard, Prometheus config, and Docker Compose overlay in `deploy/observability/`.
-- **Kubernetes manifests**: production-grade `deployment.yaml`, network policy, external-secret, and certificate templates under `deploy/kubernetes/`.
 - **Operational runbooks**: incident response, secret management, API-key rotation, and onboarding guides added to `docs/runbooks/`.
 
 ---
@@ -178,6 +179,8 @@ env     = {
 }
 ```
 
+A live-source development example is included in [codex_config.example.toml](./codex_config.example.toml).
+
 ### `waggle-mcp` not on PATH?
 
 If you installed with `pipx`, ensure its bin path is available:
@@ -213,6 +216,43 @@ You're using PostgreSQL for this project.
 
 If you see that kind of recall in a new session, you're live.
 
+## Automatic Memory Setup For Codex And Antigravity
+
+Registering Waggle as an MCP server is necessary, but it is not sufficient for automatic cross-session memory. The client still needs instructions telling the agent to use Waggle in the background.
+
+There is not a better generic repo-side mechanism for third-party MCP clients today. If the client does not provide a runtime hook that automatically calls memory tools, the practical setup is:
+- register Waggle as an MCP server
+- add an agent instruction / User Rule telling the model when to call Waggle
+
+If a client later exposes a native pre-answer / post-turn orchestration hook, that is better than prompt rules. Until then, prompt-level rules are the portable solution across Codex and Antigravity.
+
+Use the same rule text in:
+- **Codex**: your global/project instructions or equivalent agent rule layer
+- **Antigravity**: **User Rules** / custom instructions for the agent
+
+A copy-pasteable version also lives in [docs/automatic-memory-rules.md](./docs/automatic-memory-rules.md).
+
+Recommended rule text:
+
+```text
+Use Waggle automatically for conversational memory.
+
+At the start of a new session, if project, agent, or session scope is known, call prime_context.
+
+Before answering questions that may depend on prior decisions, preferences, constraints, project state, or earlier conversation context, call query_graph with the narrowest relevant scope.
+
+After completed turns that contain durable information such as decisions, preferences, constraints, requirements, user corrections, project facts, or meaningful task outcomes, call observe_conversation automatically.
+
+Do not ask the user to trigger Waggle manually. Use it in the background when relevant.
+```
+
+### Important Findings
+
+- **MCP registration alone does not create automatic memory.** If the client only exposes Waggle as a tool, cross-session recall can still fail.
+- **Scope must match across sessions.** Store and recall need to use the same database, tenant, and relevant scope such as `project`.
+- **Rollover handoff is separate from live-turn memory.** `ingest-transcript-handoff` fixes end-of-window/session import and export. Live conversational memory still depends on automatic `observe_conversation` and `query_graph` usage during normal chats.
+- **For same-machine multi-client sharing, use the same `WAGGLE_DB_PATH`.** Codex and Antigravity can share one local brain if both point to the same SQLite file.
+
 ### Quick-reference tool table
 
 | Ask the agent… | Tool called |
@@ -238,6 +278,7 @@ Waggle includes a built-in CLI for setup, maintenance, and learning the memory s
 | `waggle-mcp features` | **Recommended** — Explain the main tools, graph workflows, and how connected context reaches the model. |
 | `waggle-mcp init` | Interactive setup wizard to configure Codex, Claude, Cursor, or Antigravity. |
 | `waggle-mcp serve` | Run the MCP server (usually started automatically by your client). |
+| `waggle-mcp ingest-transcript-handoff` | Ingest a rollover transcript and export a handoff bundle for the next window or IDE. |
 | `waggle-mcp export-context-bundle` | Export a portable Markdown/JSON context pack for another AI. |
 | `waggle-mcp export-markdown-vault` | Export your memory graph as an Obsidian-style vault. |
 
