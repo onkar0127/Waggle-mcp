@@ -596,6 +596,18 @@ For operational details, scaling considerations, tool-level behavior, and the fu
 
 Run `waggle-mcp doctor` first — it catches the most common issues automatically.
 
+### Install / dependency failures (and fixes)
+
+These are the most common install-time failures and what to do next.
+
+| Failure (example) | Likely cause | Fix |
+|---|---|---|
+| `waggle-mcp: command not found` right after install | `pipx` bin dir not on `PATH` | Run `pipx ensurepath` and restart your terminal |
+| `zsh: command not found: python` | System has only `python3` (or `python` is not on `PATH`) | Use `python3 ...` for ad-hoc commands; install Python 3.11+ (macOS: Homebrew Python recommended) |
+| `ModuleNotFoundError: No module named 'mcp'` or `... 'networkx'` | Wrong environment (e.g. running from global Python instead of the `pipx` venv) or incomplete install | Prefer `pipx install waggle-mcp` and run via `waggle-mcp ...`. If you need to repair an existing pipx env: `pipx runpip waggle-mcp install -U mcp networkx` |
+| `pipx install waggle-mcp` fails while building / installing `sentence-transformers` / `torch` | Python/OS wheel mismatch or outdated `pip` | Use Python 3.11+; upgrade tooling: `python3 -m pip install -U pip setuptools wheel`. If you only need an offline-safe setup, you can still run Waggle in deterministic mode once installed: `WAGGLE_MODEL=deterministic waggle-mcp serve` |
+| `pytest` collection errors about missing packages | Dev deps not installed | Install dev extras in the same env: `pip install -e '.[dev]'` (repo) or `pipx inject waggle-mcp 'waggle-mcp[dev]'` (pipx) |
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `store_node` / `query_graph` hangs forever | Embedding model downloading on first run (~420 MB) | Set `WAGGLE_MODEL=deterministic` for instant offline mode, or wait for download to finish |
