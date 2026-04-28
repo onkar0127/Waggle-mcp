@@ -18,6 +18,7 @@ from waggle.server import (
     _build_parser,
     _default_graph,
     _run_admin_command,
+    _run_graph_editor_command,
     _run_setup,
     _setup_clients_from_args,
     _write_codex_agents,
@@ -110,6 +111,112 @@ def test_tool_schemas_are_glama_friendly(tmp_path: Path) -> None:
         assert isinstance(tool.inputSchema["properties"], dict)
         for field_name, field_schema in tool.inputSchema["properties"].items():
             assert field_schema.get("description"), f"{tool.name}.{field_name} is missing a description"
+
+
+def test_parser_accepts_graph_editor_commands() -> None:
+    parser = _build_parser()
+
+    edit_args = parser.parse_args(["edit-graph", "--port", "8787", "--no-open"])
+    view_args = parser.parse_args(["view-graph"])
+
+    assert edit_args.command == "edit-graph"
+    assert edit_args.port == 8787
+    assert edit_args.open is False
+    assert view_args.command == "view-graph"
+    assert view_args.open is True
+
+
+def test_run_graph_editor_command_opens_browser_and_starts_uvicorn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="fake-model",
+        db_path=str(tmp_path / "server-memory.db"),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+    args = SimpleNamespace(host="127.0.0.1", port=8787, open=True)
+    opened: dict[str, str] = {}
+    served: dict[str, object] = {}
+
+    class ImmediateTimer:
+        def __init__(self, interval: float, fn):
+            self.interval = interval
+            self.fn = fn
+            self.daemon = False
+
+        def start(self) -> None:
+            self.fn()
+
+    monkeypatch.setattr("waggle.server.webbrowser.open", lambda url: opened.setdefault("url", url))
+    monkeypatch.setattr("waggle.server.threading.Timer", ImmediateTimer)
+    monkeypatch.setattr(
+        "waggle.server.uvicorn.run",
+        lambda app, host, port, log_level: served.update(
+            {"app": app, "host": host, "port": port, "log_level": log_level}
+        ),
+    )
+
+    exit_code = _run_graph_editor_command(config, args)
+
+    assert exit_code == 0
+    assert opened["url"] == "http://127.0.0.1:8787/graph?mode=edit"
+    assert served["host"] == "127.0.0.1"
+    assert served["port"] == 8787
+
+
+def test_run_view_graph_command_opens_read_only_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="fake-model",
+        db_path=str(tmp_path / "server-memory.db"),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+    args = SimpleNamespace(command="view-graph", host="127.0.0.1", port=8787, open=True)
+    opened: dict[str, str] = {}
+
+    class ImmediateTimer:
+        def __init__(self, interval: float, fn):
+            self.fn = fn
+            self.daemon = False
+
+        def start(self) -> None:
+            self.fn()
+
+    monkeypatch.setattr("waggle.server.webbrowser.open", lambda url: opened.setdefault("url", url))
+    monkeypatch.setattr("waggle.server.threading.Timer", ImmediateTimer)
+    monkeypatch.setattr("waggle.server.uvicorn.run", lambda *args, **kwargs: None)
+
+    exit_code = _run_graph_editor_command(config, args)
+
+    assert exit_code == 0
+    assert opened["url"] == "http://127.0.0.1:8787/graph?mode=view"
 
 
 def test_memory_policy_prompt_and_resource(tmp_path: Path) -> None:
@@ -241,6 +348,46 @@ def test_export_and_import_backup_tools(tmp_path: Path) -> None:
     assert imported.isError is False
     assert imported.structuredContent["nodes_created"] == 1
     assert target.graph.get_stats().total_nodes == 1
+
+
+def test_export_validate_inspect_and_import_abhi_tools(tmp_path: Path) -> None:
+    source = make_app(tmp_path / "source")
+    target = make_app(tmp_path / "target")
+    source.handle_tool_call(
+        "store_node",
+        {
+            "label": "ABHI Tool Node",
+            "content": "This node should survive an ABHI round trip.",
+            "node_type": NodeType.NOTE.value,
+        },
+    )
+
+    exported = source.handle_tool_call(
+        "export_abhi",
+        {"output_path": str(tmp_path / "memory.abhi")},
+    )
+    validated = source.handle_tool_call(
+        "validate_abhi",
+        {"input_path": exported.structuredContent["output_path"]},
+    )
+    inspected = source.handle_tool_call(
+        "inspect_abhi",
+        {"input_path": exported.structuredContent["output_path"]},
+    )
+    imported = target.handle_tool_call(
+        "import_abhi",
+        {"input_path": exported.structuredContent["output_path"]},
+    )
+
+    assert exported.isError is False
+    assert exported.structuredContent["content_hash"].startswith("sha256:")
+    assert validated.isError is False
+    assert validated.structuredContent["valid"] is True
+    assert inspected.isError is False
+    assert inspected.structuredContent["node_count"] == 1
+    assert imported.isError is False
+    assert imported.structuredContent["hash_verified"] is True
+    assert imported.structuredContent["nodes_created"] == 1
 
 
 def test_export_context_bundle_tool(tmp_path: Path) -> None:

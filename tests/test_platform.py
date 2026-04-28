@@ -184,3 +184,116 @@ def test_http_app_rate_limit_and_payload_limit(tmp_path: Path) -> None:
 
         assert first.status_code == 200
         assert second.status_code == 429
+
+
+def test_http_graph_editor_routes_and_crud(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    app_server = WaggleServer(graph=graph, config=make_http_config(tmp_path))
+    app = create_http_application(app_server, app_server.config)
+
+    with TestClient(app) as client:
+        editor = client.get("/graph")
+        assert editor.status_code == 200
+        assert "Waggle Graph Studio" in editor.text
+        viewer = client.get("/graph?mode=view")
+        assert viewer.status_code == 200
+        assert "const READ_ONLY = true;" in viewer.text
+
+        created_node = client.post(
+            "/api/graph/nodes",
+            json={
+                "label": "HTTP Node",
+                "content": "Created through the graph editor API.",
+                "node_type": "note",
+                "project": "studio",
+            },
+        )
+        assert created_node.status_code == 200
+        node_id = created_node.json()["id"]
+
+        snapshot = client.get("/api/graph", params={"project": "studio"})
+        assert snapshot.status_code == 200
+        assert len(snapshot.json()["nodes"]) == 1
+
+        abhi_preview = client.get("/api/graph/abhi", params={"project": "studio"})
+        assert abhi_preview.status_code == 200
+        assert "schema" in abhi_preview.json()
+        assert abhi_preview.json()["validation"]["valid"] is True
+
+        saved_ui = client.patch(
+            "/api/graph/ui",
+            json={
+                "project": "studio",
+                "positions": {node_id: {"x": 140, "y": 280}},
+                "zoom": 1.1,
+                "viewport": {"center_x": 140, "center_y": 280},
+                "selected_nodes": [node_id],
+            },
+        )
+        assert saved_ui.status_code == 200
+        assert saved_ui.json()["positions"][node_id] == {"x": 140, "y": 280}
+
+        updated_node = client.patch(
+            f"/api/graph/nodes/{node_id}",
+            json={"label": "HTTP Node Updated", "content": "Edited in browser."},
+        )
+        assert updated_node.status_code == 200
+        assert updated_node.json()["label"] == "HTTP Node Updated"
+
+        second_node = client.post(
+            "/api/graph/nodes",
+            json={
+                "label": "HTTP Node 2",
+                "content": "Second node",
+                "node_type": "note",
+                "project": "studio",
+            },
+        )
+        second_id = second_node.json()["id"]
+
+        created_edge = client.post(
+            "/api/graph/edges",
+            json={
+                "source_id": node_id,
+                "target_id": second_id,
+                "relationship": "relates_to",
+                "weight": 1.0,
+            },
+        )
+        assert created_edge.status_code == 200
+        edge_id = created_edge.json()["id"]
+
+        updated_edge = client.patch(
+            f"/api/graph/edges/{edge_id}",
+            json={
+                "source_id": node_id,
+                "target_id": second_id,
+                "relationship": "depends_on",
+                "weight": 0.5,
+            },
+        )
+        assert updated_edge.status_code == 200
+        assert updated_edge.json()["relationship"] == "depends_on"
+
+        query_result = client.post(
+            "/api/graph/query",
+            json={"project": "studio", "query": "FIND nodes WHERE type='note' AND content CONTAINS 'browser'"},
+        )
+        assert query_result.status_code == 200
+        assert len(query_result.json()["nodes"]) == 1
+
+        diff_result = client.get("/api/graph/diff", params={"since": "24h"})
+        assert diff_result.status_code == 200
+        assert len(diff_result.json()["added_nodes"]) >= 2
+
+        exported_abhi = client.get("/api/graph/export", params={"format": "abhi", "project": "studio"})
+        assert exported_abhi.status_code == 200
+        assert '"graph"' in exported_abhi.text
+        assert '"positions"' in exported_abhi.text
+        assert "attachment; filename=\"waggle-memory.abhi\"" == exported_abhi.headers["content-disposition"]
+
+        deleted_edge = client.delete(f"/api/graph/edges/{edge_id}")
+        assert deleted_edge.status_code == 200
+
+        deleted_node = client.delete(f"/api/graph/nodes/{second_id}")
+        assert deleted_node.status_code == 200

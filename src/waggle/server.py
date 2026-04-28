@@ -8,8 +8,10 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import uuid
+import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -24,10 +26,11 @@ from mcp.server.models import InitializationOptions
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 
 from waggle import __version__
+from waggle.abhi import build_abhi_document, execute_abhi_query, validate_abhi_document
 from waggle.config import AppConfig, STARTUP_MODE_FAST, STARTUP_MODE_STRICT
 from waggle.embeddings import EmbeddingModel, EMBEDDING_FREE_TOOLS, STATUS_READY, STATUS_DISABLED
 from waggle.errors import (
@@ -38,6 +41,7 @@ from waggle.errors import (
     ValidationFailure,
 )
 from waggle.graph import MemoryGraph
+from waggle.graph_ui import render_graph_editor_html
 from waggle.logging_utils import configure_logging
 from waggle.metrics import MetricsRegistry
 from waggle.models import (
@@ -66,6 +70,8 @@ from waggle.models import (
 from waggle.rate_limit import RateLimiter
 from waggle.runtime_context import runtime_context
 from waggle.serializer import (
+    serialize_abhi_inspect,
+    serialize_abhi_validation,
     serialize_conflict_entry,
     serialize_conflicts,
     serialize_context_bundle_export,
@@ -87,11 +93,16 @@ WRITE_HEAVY_TOOLS = {
     "decompose_and_store",
     "observe_conversation",
     "import_graph_backup",
+    "import_abhi",
     "import_markdown_vault",
 }
 REQUIRED_RUNTIME_METHODS = (
     "export_context_bundle",
     "export_markdown_vault",
+    "export_abhi",
+    "import_abhi",
+    "validate_abhi",
+    "inspect_abhi",
     "list_context_scopes",
     "get_node_history",
     "import_markdown_vault",
@@ -731,6 +742,22 @@ class WaggleServer:
                 ),
             ),
             types.Tool(
+                name="export_abhi",
+                description=(
+                    "Export the current memory graph as a validated .abhi file. "
+                    "The file includes graph data, schema, constraints, AI rules, versions, queries, integrity metadata, and event definitions."
+                ),
+                inputSchema=_object_input_schema(
+                    {
+                        "output_path": {
+                            "type": "string",
+                            "description": "Optional destination .abhi file path. If omitted, Waggle chooses an export path.",
+                        },
+                        **_scope_properties(),
+                    }
+                ),
+            ),
+            types.Tool(
                 name="export_context_bundle",
                 description=(
                     "Export a portable Markdown and/or JSON context bundle for handing memory to another AI or a human. "
@@ -809,6 +836,36 @@ class WaggleServer:
                 ),
                 inputSchema=_object_input_schema(
                     {"input_path": {"type": "string", "description": "Path to the JSON backup file to import."}},
+                    required=["input_path"],
+                ),
+            ),
+            types.Tool(
+                name="import_abhi",
+                description=(
+                    "Import an .abhi file with integrity verification, schema validation, and constraint checks before merging it into memory."
+                ),
+                inputSchema=_object_input_schema(
+                    {"input_path": {"type": "string", "description": "Path to the .abhi file to import."}},
+                    required=["input_path"],
+                ),
+            ),
+            types.Tool(
+                name="validate_abhi",
+                description=(
+                    "Validate an .abhi file without importing it. Verifies integrity hash, schema compliance, and constraint satisfaction."
+                ),
+                inputSchema=_object_input_schema(
+                    {"input_path": {"type": "string", "description": "Path to the .abhi file to validate."}},
+                    required=["input_path"],
+                ),
+            ),
+            types.Tool(
+                name="inspect_abhi",
+                description=(
+                    "Inspect an .abhi file without loading it into the memory graph. Returns summary stats, type breakdowns, and metadata counts."
+                ),
+                inputSchema=_object_input_schema(
+                    {"input_path": {"type": "string", "description": "Path to the .abhi file to inspect."}},
                     required=["input_path"],
                 ),
             ),
@@ -1307,6 +1364,25 @@ class WaggleServer:
                             "edge_count": backup.edge_count,
                         },
                     )
+                elif name == "export_abhi":
+                    exported = graph.export_abhi(
+                        output_path=arguments.get("output_path"),
+                        project=arguments.get("project", ""),
+                        agent_id=arguments.get("agent_id", ""),
+                        session_id=arguments.get("session_id", ""),
+                    )
+                    result = self._tool_result(
+                        f"Exported ABHI memory file to {exported.output_path}.",
+                        {
+                            "output_path": exported.output_path,
+                            "tenant_id": exported.tenant_id,
+                            "schema_version": exported.schema_version,
+                            "abhi_spec_version": exported.abhi_spec_version,
+                            "node_count": exported.node_count,
+                            "edge_count": exported.edge_count,
+                            "content_hash": exported.content_hash,
+                        },
+                    )
                 elif name == "export_context_bundle":
                     exported = graph.export_context_bundle(
                         mode=arguments.get("mode", "prime"),
@@ -1341,6 +1417,34 @@ class WaggleServer:
                             "edges_created": imported.edges_created,
                             "edges_updated": imported.edges_updated,
                         },
+                    )
+                elif name == "import_abhi":
+                    imported = graph.import_abhi(input_path=arguments["input_path"])
+                    result = self._tool_result(
+                        f"Imported ABHI memory file from {imported.input_path}.",
+                        {
+                            "input_path": imported.input_path,
+                            "tenant_id": imported.tenant_id,
+                            "schema_version": imported.schema_version,
+                            "abhi_spec_version": imported.abhi_spec_version,
+                            "nodes_created": imported.nodes_created,
+                            "nodes_updated": imported.nodes_updated,
+                            "edges_created": imported.edges_created,
+                            "edges_updated": imported.edges_updated,
+                            "hash_verified": imported.hash_verified,
+                        },
+                    )
+                elif name == "validate_abhi":
+                    validation = graph.validate_abhi(input_path=arguments["input_path"])
+                    result = self._tool_result(
+                        serialize_abhi_validation(validation),
+                        validation.model_dump(mode="json"),
+                    )
+                elif name == "inspect_abhi":
+                    inspection = graph.inspect_abhi(input_path=arguments["input_path"])
+                    result = self._tool_result(
+                        serialize_abhi_inspect(inspection),
+                        inspection.model_dump(mode="json"),
                     )
                 elif name == "export_markdown_vault":
                     exported = graph.export_markdown_vault(
@@ -1912,16 +2016,351 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
     async def metrics_endpoint(request: Request) -> Response:
         return PlainTextResponse(request.app.state.http_service.metrics.render_prometheus())
 
+    def _scope_from_request(request: Request) -> dict[str, str]:
+        return {
+            "project": request.query_params.get("project", "").strip(),
+            "agent_id": request.query_params.get("agent_id", "").strip(),
+            "session_id": request.query_params.get("session_id", "").strip(),
+        }
+
+    def _build_scoped_abhi(scope: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+        snapshot = app_server.graph.get_graph_snapshot(**scope)
+        return snapshot, build_abhi_document(snapshot)
+
+    def _validate_live_snapshot(snapshot: dict[str, Any]) -> None:
+        validation = validate_abhi_document(build_abhi_document(snapshot), input_path="live://graph")
+        blocking_errors = [
+            error
+            for error in validation.errors
+            if "cannot originate from node type" not in error and "cannot target node type" not in error
+        ]
+        if blocking_errors:
+            raise ValidationFailure("; ".join(blocking_errors))
+
+    def _node_snapshot_payload(
+        *,
+        snapshot: dict[str, Any],
+        payload: dict[str, Any],
+        existing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = existing or {}
+        now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        return {
+            "id": str(current.get("id") or payload.get("id") or f"preview-{uuid.uuid4()}").strip(),
+            "tenant_id": str(snapshot.get("tenant_id", "")),
+            "agent_id": str(payload.get("agent_id", current.get("agent_id", "")) or current.get("agent_id", "")),
+            "project": str(payload.get("project", current.get("project", "")) or current.get("project", "")),
+            "session_id": str(payload.get("session_id", current.get("session_id", "")) or current.get("session_id", "")),
+            "context_window_id": current.get("context_window_id"),
+            "label": str(payload.get("label", current.get("label", "")) or current.get("label", "")).strip(),
+            "content": str(payload.get("content", current.get("content", "")) or current.get("content", "")).strip(),
+            "node_type": str(payload.get("node_type", current.get("node_type", "note")) or current.get("node_type", "note")).strip(),
+            "tags": payload.get("tags", current.get("tags", [])) or [],
+            "source_prompt": current.get("source_prompt", ""),
+            "metadata": current.get("metadata", {}),
+            "evidence_records": current.get("evidence_records", []),
+            "valid_from": current.get("valid_from"),
+            "valid_to": current.get("valid_to"),
+            "created_at": current.get("created_at", now),
+            "updated_at": now,
+            "access_count": current.get("access_count", 0),
+        }
+
+    def _edge_snapshot_payload(
+        *,
+        snapshot: dict[str, Any],
+        payload: dict[str, Any],
+        existing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = existing or {}
+        now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        return {
+            "id": str(current.get("id") or payload.get("id") or f"preview-{uuid.uuid4()}").strip(),
+            "tenant_id": str(snapshot.get("tenant_id", "")),
+            "source_id": str(payload.get("source_id", current.get("source_id", "")) or current.get("source_id", "")).strip(),
+            "target_id": str(payload.get("target_id", current.get("target_id", "")) or current.get("target_id", "")).strip(),
+            "relationship": str(payload.get("relationship", current.get("relationship", "")) or current.get("relationship", "")).strip(),
+            "weight": float(payload.get("weight", current.get("weight", 1.0)) or current.get("weight", 1.0)),
+            "metadata": current.get("metadata", {}),
+            "created_at": current.get("created_at", now),
+        }
+
+    async def graph_editor(request: Request) -> Response:
+        mode = request.query_params.get("mode", "edit").strip().lower()
+        if mode not in {"edit", "view"}:
+            mode = "edit"
+        return HTMLResponse(render_graph_editor_html(mode=mode))
+
+    async def graph_snapshot(request: Request) -> Response:
+        scope = _scope_from_request(request)
+        graph = app_server.graph
+        snapshot = graph.get_graph_snapshot(**scope)
+        return JSONResponse(
+            {
+                "tenant_id": snapshot.get("tenant_id", ""),
+                "schema_version": snapshot.get("schema_version", 1),
+                "nodes": snapshot.get("nodes", []),
+                "edges": snapshot.get("edges", []),
+                "ui": snapshot.get("ui", {}),
+                "node_types": [node_type.value for node_type in NodeType],
+                "relation_types": [relation.value for relation in RelationType],
+            }
+        )
+
+    async def graph_abhi_preview(request: Request) -> Response:
+        scope = _scope_from_request(request)
+        snapshot, document = _build_scoped_abhi(scope)
+        validation = validate_abhi_document(document, input_path="live://graph")
+        return JSONResponse(
+            {
+                "tenant_id": snapshot.get("tenant_id", ""),
+                "scope": scope,
+                "schema": document.get("schema", {}),
+                "constraints": document.get("constraints", []),
+                "queries": document.get("queries", {}),
+                "events": document.get("events", {}),
+                "versions": document.get("versions", []),
+                "integrity": document.get("integrity", {}),
+                "validation": validation.model_dump(mode="json"),
+            }
+        )
+
+    async def graph_query(request: Request) -> Response:
+        payload = await request.json()
+        scope = {
+            "project": str(payload.get("project", "")).strip(),
+            "agent_id": str(payload.get("agent_id", "")).strip(),
+            "session_id": str(payload.get("session_id", "")).strip(),
+        }
+        _, document = _build_scoped_abhi(scope)
+        result = execute_abhi_query(
+            document,
+            query_id=str(payload.get("query_id", "")).strip(),
+            query_text=str(payload.get("query", "")).strip(),
+        )
+        return JSONResponse(result)
+
+    async def graph_diff_feed(request: Request) -> Response:
+        since = request.query_params.get("since", "24h").strip() or "24h"
+        diff = app_server.graph.graph_diff(since=since)
+        return JSONResponse(
+            {
+                "since": diff.since,
+                "added_nodes": [node.model_dump(mode="json") for node in diff.added_nodes],
+                "updated_nodes": [node.model_dump(mode="json") for node in diff.updated_nodes],
+                "created_edges": [edge.model_dump(mode="json") for edge in diff.created_edges],
+                "contradiction_edges": [edge.model_dump(mode="json") for edge in diff.contradiction_edges],
+            }
+        )
+
+    async def graph_save_ui(request: Request) -> Response:
+        payload = await request.json()
+        graph = app_server.graph
+        saved = graph.save_ui_state(
+            project=str(payload.get("project", "")).strip(),
+            agent_id=str(payload.get("agent_id", "")).strip(),
+            session_id=str(payload.get("session_id", "")).strip(),
+            positions=payload.get("positions"),
+            zoom=float(payload["zoom"]) if "zoom" in payload and payload.get("zoom") is not None else None,
+            viewport=payload.get("viewport"),
+            groups=payload.get("groups"),
+            collapsed_groups=payload.get("collapsed_groups"),
+            selected_nodes=payload.get("selected_nodes"),
+        )
+        return JSONResponse(saved)
+
+    async def graph_create_node(request: Request) -> Response:
+        payload = await request.json()
+        graph = app_server.graph
+        scope = {
+            "project": str(payload.get("project", "")).strip(),
+            "agent_id": str(payload.get("agent_id", "")).strip(),
+            "session_id": str(payload.get("session_id", "")).strip(),
+        }
+        snapshot = graph.get_graph_snapshot(**scope)
+        snapshot["nodes"] = [*snapshot.get("nodes", []), _node_snapshot_payload(snapshot=snapshot, payload=payload)]
+        _validate_live_snapshot(snapshot)
+        created = graph.add_node(
+            label=str(payload.get("label", "")).strip(),
+            content=str(payload.get("content", "")).strip(),
+            node_type=NodeType(str(payload.get("node_type", "note")).strip() or "note"),
+            tags=[str(tag).strip() for tag in payload.get("tags", []) if str(tag).strip()],
+            agent_id=str(payload.get("agent_id", "")).strip(),
+            project=str(payload.get("project", "")).strip(),
+            session_id=str(payload.get("session_id", "")).strip(),
+        )
+        return JSONResponse(created.node.model_dump(mode="json"))
+
+    async def graph_update_node(request: Request) -> Response:
+        node_id = request.path_params["node_id"]
+        payload = await request.json()
+        graph = app_server.graph
+        snapshot = graph.get_graph_snapshot()
+        existing = next((node for node in snapshot.get("nodes", []) if str(node.get("id", "")).strip() == node_id), None)
+        if existing is None:
+            raise ValidationFailure(f"Node not found: {node_id}")
+        snapshot["nodes"] = [
+            _node_snapshot_payload(snapshot=snapshot, payload=payload, existing=existing)
+            if str(node.get("id", "")).strip() == node_id
+            else node
+            for node in snapshot.get("nodes", [])
+        ]
+        _validate_live_snapshot(snapshot)
+        updated = graph.update_node(
+            node_id=node_id,
+            label=payload.get("label"),
+            content=payload.get("content"),
+            tags=payload.get("tags"),
+        )
+        return JSONResponse(updated.model_dump(mode="json"))
+
+    async def graph_delete_node(request: Request) -> Response:
+        node_id = request.path_params["node_id"]
+        graph = app_server.graph
+        deleted = graph.delete_node(node_id=node_id)
+        return JSONResponse(deleted.model_dump(mode="json"))
+
+    async def graph_create_edge(request: Request) -> Response:
+        payload = await request.json()
+        graph = app_server.graph
+        snapshot = graph.get_graph_snapshot()
+        snapshot["edges"] = [*snapshot.get("edges", []), _edge_snapshot_payload(snapshot=snapshot, payload=payload)]
+        _validate_live_snapshot(snapshot)
+        edge = graph.add_edge(
+            source_id=str(payload.get("source_id", "")).strip(),
+            target_id=str(payload.get("target_id", "")).strip(),
+            relationship=str(payload.get("relationship", "")).strip(),
+            weight=float(payload.get("weight", 1.0)),
+        )
+        return JSONResponse(edge.model_dump(mode="json"))
+
+    async def graph_update_edge(request: Request) -> Response:
+        edge_id = request.path_params["edge_id"]
+        payload = await request.json()
+        graph = app_server.graph
+        snapshot = graph.get_graph_snapshot()
+        existing = next((item for item in snapshot.get("edges", []) if str(item.get("id", "")).strip() == edge_id), None)
+        if existing is None:
+            raise ValidationFailure(f"Edge not found: {edge_id}")
+        snapshot["edges"] = [
+            _edge_snapshot_payload(snapshot=snapshot, payload=payload, existing=existing)
+            if str(item.get("id", "")).strip() == edge_id
+            else item
+            for item in snapshot.get("edges", [])
+        ]
+        _validate_live_snapshot(snapshot)
+        edge = graph.update_edge(
+            edge_id=edge_id,
+            source_id=str(payload.get("source_id", "")).strip() or None,
+            target_id=str(payload.get("target_id", "")).strip() or None,
+            relationship=str(payload.get("relationship", "")).strip() or None,
+            weight=float(payload["weight"]) if "weight" in payload and payload.get("weight") is not None else None,
+        )
+        return JSONResponse(edge.model_dump(mode="json"))
+
+    async def graph_delete_edge(request: Request) -> Response:
+        edge_id = request.path_params["edge_id"]
+        graph = app_server.graph
+        edge = graph.delete_edge(edge_id=edge_id)
+        return JSONResponse(edge.model_dump(mode="json"))
+
+    async def graph_export(request: Request) -> Response:
+        scope = _scope_from_request(request)
+        export_format = request.query_params.get("format", "abhi").strip().lower()
+        graph = app_server.graph
+        if export_format == "abhi":
+            exported = graph.export_abhi(**scope)
+            content = Path(exported.output_path).read_text(encoding="utf-8")
+            return Response(
+                content,
+                media_type="application/json",
+                headers={"Content-Disposition": 'attachment; filename="waggle-memory.abhi"'},
+            )
+        if export_format == "json":
+            snapshot = graph.get_graph_snapshot(**scope)
+            return Response(
+                json.dumps(snapshot, indent=2),
+                media_type="application/json",
+                headers={"Content-Disposition": 'attachment; filename="waggle-backup.json"'},
+            )
+        raise ValidationFailure("format must be one of: abhi, json.")
+
+    async def graph_import(request: Request) -> Response:
+        payload = await request.json()
+        import_format = str(payload.get("format", "abhi")).strip().lower()
+        content = str(payload.get("content", ""))
+        suffix = ".abhi" if import_format == "abhi" else ".json"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+            temp_path = Path(handle.name)
+        try:
+            temp_path.write_text(content, encoding="utf-8")
+            graph = app_server.graph
+            if import_format == "abhi":
+                imported = graph.import_abhi(input_path=temp_path)
+            elif import_format == "json":
+                imported = graph.import_graph_backup(input_path=temp_path)
+            else:
+                raise ValidationFailure("format must be one of: abhi, json.")
+            return JSONResponse(imported.model_dump(mode="json"))
+        finally:
+            temp_path.unlink(missing_ok=True)
+
     app = Starlette(
         routes=[
             Route("/health/live", live),
             Route("/health/ready", ready),
             Route("/metrics", metrics_endpoint),
+            Route("/graph", graph_editor),
+            Route("/api/graph", graph_snapshot, methods=["GET"]),
+            Route("/api/graph/abhi", graph_abhi_preview, methods=["GET"]),
+            Route("/api/graph/query", graph_query, methods=["POST"]),
+            Route("/api/graph/diff", graph_diff_feed, methods=["GET"]),
+            Route("/api/graph/ui", graph_save_ui, methods=["PATCH"]),
+            Route("/api/graph/nodes", graph_create_node, methods=["POST"]),
+            Route("/api/graph/nodes/{node_id:str}", graph_update_node, methods=["PATCH"]),
+            Route("/api/graph/nodes/{node_id:str}", graph_delete_node, methods=["DELETE"]),
+            Route("/api/graph/edges", graph_create_edge, methods=["POST"]),
+            Route("/api/graph/edges/{edge_id:str}", graph_update_edge, methods=["PATCH"]),
+            Route("/api/graph/edges/{edge_id:str}", graph_delete_edge, methods=["DELETE"]),
+            Route("/api/graph/export", graph_export, methods=["GET"]),
+            Route("/api/graph/import", graph_import, methods=["POST"]),
             Mount("/mcp", app=service.mcp_asgi),
         ],
         lifespan=service.lifespan,
     )
     return app
+
+
+def _run_graph_editor_command(config: AppConfig, args: argparse.Namespace) -> int:
+    host = str(getattr(args, "host", "") or config.http_host or "127.0.0.1")
+    port = int(getattr(args, "port", 8686) or 8686)
+    should_open = bool(getattr(args, "open", True))
+    mode = str(getattr(args, "command", "edit-graph")).strip().lower()
+    page_mode = "view" if mode == "view-graph" else "edit"
+
+    config.transport = "http"
+    config.http_host = host
+    config.http_port = port
+    app_server = WaggleServer(config=config)
+    http_app = create_http_application(app_server, config)
+    url = f"http://{host}:{port}/graph?mode={page_mode}"
+
+    print(f"Launching Waggle Graph Studio at {url}")
+    print("Use Ctrl+C in this terminal to stop the editor server.")
+
+    if should_open:
+        def _open_browser() -> None:
+            try:
+                webbrowser.open(url)
+            except Exception as exc:  # pragma: no cover
+                LOGGER.warning("graph_editor_open_failed", extra={"error": str(exc), "url": url})
+
+        timer = threading.Timer(0.4, _open_browser)
+        timer.daemon = True
+        timer.start()
+
+    uvicorn.run(http_app, host=host, port=port, log_level=config.log_level.lower())
+    return 0
 
 
 _APP: WaggleServer | None = None
@@ -2054,6 +2493,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("serve", help="Run the MCP server using the configured stdio or HTTP transport.")
+    graph_editor = subparsers.add_parser(
+        "edit-graph",
+        help="Launch the visual graph editor in a browser window.",
+        description=(
+            "Start the Waggle HTTP app for local graph editing and open /graph in the browser by default. "
+            "Use this for mouse-and-keyboard graph editing: add, remove, connect, reposition, import, and export."
+        ),
+    )
+    graph_editor.add_argument("--host", default="127.0.0.1")
+    graph_editor.add_argument("--port", type=int, default=8686)
+    graph_editor.add_argument("--open", action=argparse.BooleanOptionalAction, default=True)
+
+    graph_viewer = subparsers.add_parser(
+        "view-graph",
+        help="Launch the visual graph viewer/editor in a browser window.",
+        description="Alias for edit-graph. Starts the local graph UI and opens it in the browser by default.",
+    )
+    graph_viewer.add_argument("--host", default="127.0.0.1")
+    graph_viewer.add_argument("--port", type=int, default=8686)
+    graph_viewer.add_argument("--open", action=argparse.BooleanOptionalAction, default=True)
 
     create_tenant = subparsers.add_parser("create-tenant", help="Create or update a tenant record in the active backend.")
     create_tenant.add_argument("--tenant-id", required=True)
@@ -2072,6 +2531,35 @@ def _build_parser() -> argparse.ArgumentParser:
     migrate_sqlite = subparsers.add_parser("migrate-sqlite", help="Export a SQLite graph and import it into the configured Neo4j backend.")
     migrate_sqlite.add_argument("--db-path", required=True)
     migrate_sqlite.add_argument("--tenant-id", required=True)
+
+    export_abhi = subparsers.add_parser(
+        "export",
+        help="Export the current memory graph in a portable format.",
+    )
+    export_abhi.add_argument("--format", choices=["abhi"], default="abhi")
+    export_abhi.add_argument("--output", dest="output_path", default=None)
+    export_abhi.add_argument("--project", default="")
+    export_abhi.add_argument("--agent-id", default="")
+    export_abhi.add_argument("--session-id", default="")
+
+    import_abhi = subparsers.add_parser(
+        "import",
+        help="Import a portable memory file into the active backend.",
+    )
+    import_abhi.add_argument("--format", choices=["abhi"], default="abhi")
+    import_abhi.add_argument("--input", dest="input_path", required=True)
+
+    validate_abhi = subparsers.add_parser(
+        "validate",
+        help="Validate a portable .abhi memory file.",
+    )
+    validate_abhi.add_argument("--input", dest="input_path", required=True)
+
+    inspect_abhi = subparsers.add_parser(
+        "inspect",
+        help="Inspect an .abhi memory file without importing it.",
+    )
+    inspect_abhi.add_argument("--input", dest="input_path", required=True)
 
     export_context_bundle = subparsers.add_parser(
         "export-context-bundle",
@@ -2262,6 +2750,31 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
             )
         )
         temp_path.unlink(missing_ok=True)
+        return 0
+    if args.command == "export":
+        if args.format != "abhi":
+            raise ValidationFailure(f"Unsupported export format: {args.format}")
+        exported = backend.export_abhi(
+            output_path=args.output_path,
+            project=getattr(args, "project", ""),
+            agent_id=getattr(args, "agent_id", ""),
+            session_id=getattr(args, "session_id", ""),
+        )
+        print(json.dumps(exported.model_dump(mode="json"), indent=2))
+        return 0
+    if args.command == "import":
+        if args.format != "abhi":
+            raise ValidationFailure(f"Unsupported import format: {args.format}")
+        imported = backend.import_abhi(input_path=args.input_path)
+        print(json.dumps(imported.model_dump(mode="json"), indent=2))
+        return 0
+    if args.command == "validate":
+        validation = backend.validate_abhi(input_path=args.input_path)
+        print(json.dumps(validation.model_dump(mode="json"), indent=2))
+        return 0 if validation.valid else 1
+    if args.command == "inspect":
+        inspected = backend.inspect_abhi(input_path=args.input_path)
+        print(json.dumps(inspected.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "export-context-bundle":
         exported = backend.export_context_bundle(
@@ -3124,6 +3637,19 @@ def main() -> None:
     log_stream = sys.stderr if config.transport == "stdio" else sys.stdout
     configure_logging(config.log_level, stream=log_stream)
     LOGGER.info("waggle_startup")
+    if command in {"edit-graph", "view-graph"}:
+        try:
+            exit_code = _run_graph_editor_command(config, args)
+        except ValidationFailure as exc:
+            _emit_cli_error("validation_error", str(exc), {})
+            sys.exit(1)
+        except WaggleError as exc:
+            _emit_cli_error(exc.code, str(exc), {"status_code": exc.status_code})
+            sys.exit(2)
+        except Exception as exc:
+            _emit_cli_error("internal_error", str(exc), {"type": type(exc).__name__})
+            sys.exit(3)
+        sys.exit(exit_code or 0)
     if command != "serve":
         try:
             exit_code = _run_admin_command(config, args)

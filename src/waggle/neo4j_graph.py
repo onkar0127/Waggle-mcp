@@ -11,6 +11,15 @@ from uuid import uuid4
 import networkx as nx
 import numpy as np
 
+from waggle.abhi import (
+    ABHI_SPEC_VERSION,
+    abhi_to_snapshot,
+    filter_snapshot_by_scope,
+    inspect_abhi_document,
+    load_abhi_document,
+    validate_abhi_document,
+    write_abhi_document,
+)
 from waggle.auth import generate_api_key, hash_api_key, verify_api_key
 from waggle.context_bundle import build_context_bundle, build_query_summary, export_context_bundle_files
 from waggle.evidence import build_observation_evidence, merge_evidence_records, merge_validity_windows
@@ -51,6 +60,10 @@ from waggle.markdown_vault import (
     vault_filename,
 )
 from waggle.models import (
+    AbhiExportResult,
+    AbhiImportResult,
+    AbhiInspectResult,
+    AbhiValidationResult,
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
@@ -92,6 +105,19 @@ from waggle.models import (
 
 SCHEMA_VERSION = 2
 
+_UI_STATE_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+
+def _default_ui_state() -> dict[str, Any]:
+    return {
+        "positions": {},
+        "zoom": 1.0,
+        "viewport": {"center_x": 0, "center_y": 0},
+        "groups": [],
+        "collapsed_groups": [],
+        "selected_nodes": [],
+    }
+
 
 def _parse_datetime(raw: str) -> datetime:
     value = datetime.fromisoformat(raw)
@@ -116,6 +142,24 @@ def _decode_metadata(raw: Any) -> dict[str, Any]:
             return {}
         return decoded if isinstance(decoded, dict) else {}
     return {}
+
+
+def _decode_list(raw: Any) -> list[Any]:
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return decoded if isinstance(decoded, list) else []
+    return []
+
+
+def _decode_string_list(raw: Any) -> list[str]:
+    return [str(item).strip() for item in _decode_list(raw) if str(item).strip()]
 
 
 def _encode_evidence_records(records: list[EvidenceRecord]) -> str:
@@ -564,6 +608,104 @@ class Neo4jMemoryGraph:
             if node is None:
                 raise ValueError(f"Node not found: {node_id}")
             return node
+
+    def get_ui_state(
+        self,
+        *,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        key = (self.tenant_id, project.strip(), agent_id.strip(), session_id.strip())
+        with self._lock, self._session() as session:
+            record = session.run(
+                """
+                MATCH (ui:GraphUIState {
+                    tenant_id: $tenant_id,
+                    project: $project,
+                    agent_id: $agent_id,
+                    session_id: $session_id
+                })
+                RETURN ui.positions AS positions,
+                       ui.zoom AS zoom,
+                       ui.viewport AS viewport,
+                       ui.groups AS groups,
+                       ui.collapsed_groups AS collapsed_groups,
+                       ui.selected_nodes AS selected_nodes
+                LIMIT 1
+                """,
+                tenant_id=self.tenant_id,
+                project=project.strip(),
+                agent_id=agent_id.strip(),
+                session_id=session_id.strip(),
+            ).single()
+        if record is None:
+            return json.loads(json.dumps(_UI_STATE_CACHE.get(key, _default_ui_state())))
+        value = {
+            "positions": _decode_metadata(record["positions"]),
+            "zoom": float(record["zoom"]) if record["zoom"] is not None else 1.0,
+            "viewport": _decode_metadata(record["viewport"]) or {"center_x": 0, "center_y": 0},
+            "groups": _decode_list(record["groups"]),
+            "collapsed_groups": _decode_string_list(record["collapsed_groups"]),
+            "selected_nodes": _decode_string_list(record["selected_nodes"]),
+        }
+        _UI_STATE_CACHE[key] = json.loads(json.dumps(value))
+        return json.loads(json.dumps(value))
+
+    def save_ui_state(
+        self,
+        *,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+        positions: dict[str, Any] | None = None,
+        zoom: float | None = None,
+        viewport: dict[str, Any] | None = None,
+        groups: list[dict[str, Any]] | None = None,
+        collapsed_groups: list[str] | None = None,
+        selected_nodes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        key = (self.tenant_id, project.strip(), agent_id.strip(), session_id.strip())
+        current = self.get_ui_state(project=project, agent_id=agent_id, session_id=session_id)
+        merged = {
+            "positions": positions if positions is not None else current["positions"],
+            "zoom": float(zoom if zoom is not None else current["zoom"]),
+            "viewport": viewport if viewport is not None else current["viewport"],
+            "groups": groups if groups is not None else current["groups"],
+            "collapsed_groups": collapsed_groups if collapsed_groups is not None else current["collapsed_groups"],
+            "selected_nodes": selected_nodes if selected_nodes is not None else current["selected_nodes"],
+        }
+        with self._lock, self._session() as session:
+            session.run(
+                """
+                MERGE (ui:GraphUIState {
+                    tenant_id: $tenant_id,
+                    project: $project,
+                    agent_id: $agent_id,
+                    session_id: $session_id
+                })
+                SET ui.positions = $positions,
+                    ui.zoom = $zoom,
+                    ui.viewport = $viewport,
+                    ui.groups = $groups,
+                    ui.collapsed_groups = $collapsed_groups,
+                    ui.selected_nodes = $selected_nodes,
+                    ui.updated_at = $updated_at
+                """,
+                tenant_id=self.tenant_id,
+                project=project.strip(),
+                agent_id=agent_id.strip(),
+                session_id=session_id.strip(),
+                positions=_encode_metadata(merged["positions"]),
+                zoom=merged["zoom"],
+                viewport=_encode_metadata(merged["viewport"]),
+                groups=json.dumps(merged["groups"], sort_keys=True),
+                collapsed_groups=json.dumps(merged["collapsed_groups"], sort_keys=True),
+                selected_nodes=json.dumps(merged["selected_nodes"], sort_keys=True),
+                updated_at=utc_now().isoformat(),
+            ).consume()
+        _UI_STATE_CACHE[key] = json.loads(json.dumps(merged))
+        return merged
 
     def ensure_repo(self, project: str = "") -> str:
         del project
@@ -1125,6 +1267,122 @@ class Neo4jMemoryGraph:
             ).consume()
             return updated_node
 
+    def update_edge(
+        self,
+        *,
+        edge_id: str,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        relationship: str | RelationType | None = None,
+        weight: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Edge:
+        if (
+            source_id is None
+            and target_id is None
+            and relationship is None
+            and weight is None
+            and metadata is None
+        ):
+            raise ValueError("At least one field must be provided for edge update.")
+
+        with self._lock, self._session() as session:
+            existing = session.run(
+                """
+                MATCH (source:MemoryNode {tenant_id: $tenant_id})-[r:MEMORY_EDGE {tenant_id: $tenant_id, id: $id}]->(target:MemoryNode {tenant_id: $tenant_id})
+                RETURN r.id AS id, source.id AS source_id, target.id AS target_id,
+                       r.relationship AS relationship, r.weight AS weight,
+                       r.metadata AS metadata, r.created_at AS created_at
+                LIMIT 1
+                """,
+                tenant_id=self.tenant_id,
+                id=edge_id,
+            ).single()
+            if existing is None:
+                raise ValueError(f"Edge not found: {edge_id}")
+            edge = Edge(
+                id=existing["id"],
+                tenant_id=self.tenant_id,
+                source_id=existing["source_id"],
+                target_id=existing["target_id"],
+                relationship=existing["relationship"],
+                weight=float(existing["weight"]),
+                metadata=_decode_metadata(existing["metadata"]),
+                created_at=_parse_datetime(existing["created_at"]),
+            )
+            updated_edge = Edge(
+                id=edge.id,
+                tenant_id=edge.tenant_id,
+                source_id=source_id if source_id is not None else edge.source_id,
+                target_id=target_id if target_id is not None else edge.target_id,
+                relationship=relationship if relationship is not None else edge.relationship,
+                weight=weight if weight is not None else edge.weight,
+                metadata=metadata if metadata is not None else edge.metadata,
+                created_at=edge.created_at,
+            )
+            self._require_node(session, updated_edge.source_id)
+            self._require_node(session, updated_edge.target_id)
+            session.run(
+                """
+                MATCH (old_source:MemoryNode {tenant_id: $tenant_id})-[r:MEMORY_EDGE {tenant_id: $tenant_id, id: $id}]->(old_target:MemoryNode {tenant_id: $tenant_id})
+                MATCH (new_source:MemoryNode {tenant_id: $tenant_id, id: $source_id})
+                MATCH (new_target:MemoryNode {tenant_id: $tenant_id, id: $target_id})
+                CREATE (new_source)-[:MEMORY_EDGE {
+                    id: $id,
+                    tenant_id: $tenant_id,
+                    relationship: $relationship,
+                    weight: $weight,
+                    metadata: $metadata,
+                    created_at: $created_at
+                }]->(new_target)
+                DELETE r
+                """,
+                id=updated_edge.id,
+                tenant_id=self.tenant_id,
+                source_id=updated_edge.source_id,
+                target_id=updated_edge.target_id,
+                relationship=updated_edge.relationship,
+                weight=updated_edge.weight,
+                metadata=_encode_metadata(updated_edge.metadata),
+                created_at=updated_edge.created_at.isoformat(),
+            ).consume()
+            return updated_edge
+
+    def delete_edge(self, *, edge_id: str) -> Edge:
+        with self._lock, self._session() as session:
+            existing = session.run(
+                """
+                MATCH (source:MemoryNode {tenant_id: $tenant_id})-[r:MEMORY_EDGE {tenant_id: $tenant_id, id: $id}]->(target:MemoryNode {tenant_id: $tenant_id})
+                RETURN r.id AS id, source.id AS source_id, target.id AS target_id,
+                       r.relationship AS relationship, r.weight AS weight,
+                       r.metadata AS metadata, r.created_at AS created_at
+                LIMIT 1
+                """,
+                tenant_id=self.tenant_id,
+                id=edge_id,
+            ).single()
+            if existing is None:
+                raise ValueError(f"Edge not found: {edge_id}")
+            edge = Edge(
+                id=existing["id"],
+                tenant_id=self.tenant_id,
+                source_id=existing["source_id"],
+                target_id=existing["target_id"],
+                relationship=existing["relationship"],
+                weight=float(existing["weight"]),
+                metadata=_decode_metadata(existing["metadata"]),
+                created_at=_parse_datetime(existing["created_at"]),
+            )
+            session.run(
+                """
+                MATCH (:MemoryNode {tenant_id: $tenant_id})-[r:MEMORY_EDGE {tenant_id: $tenant_id, id: $id}]->(:MemoryNode {tenant_id: $tenant_id})
+                DELETE r
+                """,
+                tenant_id=self.tenant_id,
+                id=edge_id,
+            ).consume()
+            return edge
+
     def delete_node(self, *, node_id: str) -> Node:
         with self._lock, self._session() as session:
             node = self._fetch_node(session, node_id)
@@ -1395,6 +1653,39 @@ class Neo4jMemoryGraph:
             node_count=len(snapshot["nodes"]),
             edge_count=len(snapshot["edges"]),
         )
+
+    def export_abhi(
+        self,
+        *,
+        output_path: str | Path | None = None,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+    ) -> AbhiExportResult:
+        with self._lock, self._session() as session:
+            snapshot = self._build_backup_snapshot(session)
+        snapshot["ui"] = self.get_ui_state(project=project, agent_id=agent_id, session_id=session_id)
+        filtered = filter_snapshot_by_scope(snapshot, project=project, agent_id=agent_id, session_id=session_id)
+        if output_path is None:
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
+            destination = self.export_dir / f"waggle-memory-{timestamp}.abhi"
+        else:
+            destination = Path(output_path).expanduser()
+        return write_abhi_document(filtered, output_path=destination)
+
+    def get_graph_snapshot(
+        self,
+        *,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        with self._lock, self._session() as session:
+            snapshot = self._build_backup_snapshot(session)
+        filtered = filter_snapshot_by_scope(snapshot, project=project, agent_id=agent_id, session_id=session_id)
+        filtered["ui"] = self.get_ui_state(project=project, agent_id=agent_id, session_id=session_id)
+        return filtered
 
     def export_context_bundle(
         self,
@@ -1726,6 +2017,70 @@ class Neo4jMemoryGraph:
                 else:
                     self._update_snapshot_edge(session, raw_edge)
                     result.edges_updated += 1
+        self.save_ui_state(
+            positions=snapshot.get("ui", {}).get("positions", {}),
+            zoom=snapshot.get("ui", {}).get("zoom", 1.0),
+            viewport=snapshot.get("ui", {}).get("viewport", {"center_x": 0, "center_y": 0}),
+            groups=snapshot.get("ui", {}).get("groups", []),
+            collapsed_groups=snapshot.get("ui", {}).get("collapsed_groups", []),
+            selected_nodes=snapshot.get("ui", {}).get("selected_nodes", []),
+        )
+        return result
+
+    def validate_abhi(self, *, input_path: str | Path) -> AbhiValidationResult:
+        document = load_abhi_document(input_path)
+        return validate_abhi_document(document, input_path=input_path)
+
+    def inspect_abhi(self, *, input_path: str | Path) -> AbhiInspectResult:
+        document = load_abhi_document(input_path)
+        return inspect_abhi_document(document, input_path=input_path)
+
+    def import_abhi(self, *, input_path: str | Path) -> AbhiImportResult:
+        source = Path(input_path).expanduser()
+        document = load_abhi_document(source)
+        validation = validate_abhi_document(document, input_path=source)
+        if not validation.valid:
+            raise ValidationFailure("Invalid .abhi file: " + "; ".join(validation.errors))
+        snapshot = abhi_to_snapshot(document, fallback_tenant_id=self.tenant_id)
+
+        with self._lock, self._session() as session:
+            snapshot_tenant = str(snapshot.get("tenant_id") or self.tenant_id)
+            result = AbhiImportResult(
+                input_path=str(source),
+                tenant_id=self.tenant_id,
+                schema_version=int(snapshot.get("schema_version", 1)),
+                abhi_spec_version=validation.abhi_spec_version or ABHI_SPEC_VERSION,
+                hash_verified=True,
+            )
+            for raw_node in snapshot.get("nodes", []):
+                raw_node = {**raw_node, "tenant_id": raw_node.get("tenant_id") or snapshot_tenant}
+                if raw_node["tenant_id"] != self.tenant_id:
+                    raw_node["tenant_id"] = self.tenant_id
+                if self._fetch_node(session, raw_node["id"]) is None:
+                    self._insert_snapshot_node(session, raw_node)
+                    result.nodes_created += 1
+                else:
+                    self._update_snapshot_node(session, raw_node)
+                    result.nodes_updated += 1
+
+            for raw_edge in snapshot.get("edges", []):
+                raw_edge = {**raw_edge, "tenant_id": raw_edge.get("tenant_id") or snapshot_tenant}
+                if raw_edge["tenant_id"] != self.tenant_id:
+                    raw_edge["tenant_id"] = self.tenant_id
+                if self._fetch_edge_by_id(session, raw_edge["id"]) is None:
+                    self._insert_snapshot_edge(session, raw_edge)
+                    result.edges_created += 1
+                else:
+                    self._update_snapshot_edge(session, raw_edge)
+                    result.edges_updated += 1
+        self.save_ui_state(
+            positions=snapshot.get("ui", {}).get("positions", {}),
+            zoom=snapshot.get("ui", {}).get("zoom", 1.0),
+            viewport=snapshot.get("ui", {}).get("viewport", {"center_x": 0, "center_y": 0}),
+            groups=snapshot.get("ui", {}).get("groups", []),
+            collapsed_groups=snapshot.get("ui", {}).get("collapsed_groups", []),
+            selected_nodes=snapshot.get("ui", {}).get("selected_nodes", []),
+        )
         return result
 
     def decompose_and_store(self, *, content: str, context: str = "") -> SubgraphResult:

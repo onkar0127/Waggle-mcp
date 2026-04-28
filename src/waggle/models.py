@@ -268,6 +268,16 @@ class BackupResult(BaseModel):
     edge_count: int = 0
 
 
+class AbhiExportResult(BaseModel):
+    output_path: str
+    tenant_id: str = ""
+    schema_version: int = 1
+    abhi_spec_version: str = "1.0"
+    node_count: int = 0
+    edge_count: int = 0
+    content_hash: str = ""
+
+
 class ImportResult(BaseModel):
     input_path: str
     tenant_id: str = ""
@@ -276,6 +286,45 @@ class ImportResult(BaseModel):
     nodes_updated: int = 0
     edges_created: int = 0
     edges_updated: int = 0
+
+
+class AbhiImportResult(BaseModel):
+    input_path: str
+    tenant_id: str = ""
+    schema_version: int = 1
+    abhi_spec_version: str = "1.0"
+    nodes_created: int = 0
+    nodes_updated: int = 0
+    edges_created: int = 0
+    edges_updated: int = 0
+    hash_verified: bool = False
+
+
+class AbhiValidationResult(BaseModel):
+    input_path: str
+    valid: bool = False
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    node_count: int = 0
+    edge_count: int = 0
+    content_hash: str = ""
+    abhi_spec_version: str = "1.0"
+
+
+class AbhiInspectResult(BaseModel):
+    input_path: str
+    tenant_id: str = ""
+    schema_version: int = 1
+    abhi_spec_version: str = "1.0"
+    node_count: int = 0
+    edge_count: int = 0
+    node_types: list[str] = Field(default_factory=list)
+    edge_types: list[str] = Field(default_factory=list)
+    constraint_count: int = 0
+    version_count: int = 0
+    query_count: int = 0
+    event_count: int = 0
+    content_hash: str = ""
 
 
 class ObservationResult(BaseModel):

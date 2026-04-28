@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from waggle.models import (
+    AbhiInspectResult,
+    AbhiValidationResult,
     ConflictEntry,
     ConflictListResult,
     ContextBundleExportResult,
@@ -105,6 +107,49 @@ def serialize_subgraph(result: SubgraphResult) -> str:
             )
 
     lines.extend(["", "=== End Results ==="])
+    return "\n".join(lines)
+
+
+def serialize_abhi_validation(result: AbhiValidationResult) -> str:
+    lines = [
+        "=== ABHI Validation ===",
+        f"Valid: {'yes' if result.valid else 'no'}",
+        f"Nodes: {result.node_count}",
+        f"Edges: {result.edge_count}",
+        f"Spec version: {result.abhi_spec_version}",
+    ]
+    if result.content_hash:
+        lines.append(f"Content hash: {result.content_hash}")
+    if result.errors:
+        lines.extend(["", "[ERRORS]"])
+        lines.extend(f"• {error}" for error in result.errors)
+    if result.warnings:
+        lines.extend(["", "[WARNINGS]"])
+        lines.extend(f"• {warning}" for warning in result.warnings)
+    lines.append("=== End ABHI Validation ===")
+    return "\n".join(lines)
+
+
+def serialize_abhi_inspect(result: AbhiInspectResult) -> str:
+    lines = [
+        "=== ABHI Inspect ===",
+        f"Tenant: {result.tenant_id or 'n/a'}",
+        f"Nodes: {result.node_count}",
+        f"Edges: {result.edge_count}",
+        f"Schema version: {result.schema_version}",
+        f"Spec version: {result.abhi_spec_version}",
+        f"Constraints: {result.constraint_count}",
+        f"Versions: {result.version_count}",
+        f"Saved queries: {result.query_count}",
+        f"Events: {result.event_count}",
+    ]
+    if result.node_types:
+        lines.append(f"Node types: {', '.join(result.node_types)}")
+    if result.edge_types:
+        lines.append(f"Edge types: {', '.join(result.edge_types)}")
+    if result.content_hash:
+        lines.append(f"Content hash: {result.content_hash}")
+    lines.append("=== End ABHI Inspect ===")
     return "\n".join(lines)
 
 

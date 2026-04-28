@@ -1,0 +1,863 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from waggle.models import (
+    AbhiExportResult,
+    AbhiImportResult,
+    AbhiInspectResult,
+    AbhiValidationResult,
+)
+
+ABHI_SPEC_VERSION = "1.0"
+
+ABHI_NODE_TYPES: tuple[str, ...] = (
+    "fact",
+    "entity",
+    "concept",
+    "preference",
+    "decision",
+    "question",
+    "note",
+    "reason",
+    "constraint",
+    "goal",
+)
+
+ABHI_EDGE_TYPES: tuple[str, ...] = (
+    "relates_to",
+    "contradicts",
+    "depends_on",
+    "part_of",
+    "updates",
+    "derived_from",
+    "similar_to",
+    "caused_by",
+    "blocks",
+)
+
+
+def filter_snapshot_by_scope(
+    snapshot: dict[str, Any],
+    *,
+    project: str = "",
+    agent_id: str = "",
+    session_id: str = "",
+) -> dict[str, Any]:
+    if not any((project.strip(), agent_id.strip(), session_id.strip())):
+        return deepcopy(snapshot)
+
+    selected_nodes = []
+    selected_ids: set[str] = set()
+    for node in snapshot.get("nodes", []):
+        if project.strip() and str(node.get("project", "")).strip() != project.strip():
+            continue
+        if agent_id.strip() and str(node.get("agent_id", "")).strip() != agent_id.strip():
+            continue
+        if session_id.strip() and str(node.get("session_id", "")).strip() != session_id.strip():
+            continue
+        selected_nodes.append(deepcopy(node))
+        selected_ids.add(str(node["id"]))
+
+    selected_edges = [
+        deepcopy(edge)
+        for edge in snapshot.get("edges", [])
+        if str(edge.get("source_id")) in selected_ids and str(edge.get("target_id")) in selected_ids
+    ]
+
+    selected_window_ids = {
+        str(node.get("context_window_id"))
+        for node in selected_nodes
+        if str(node.get("context_window_id") or "").strip()
+    }
+    selected_windows = [
+        deepcopy(window)
+        for window in snapshot.get("context_windows", [])
+        if str(window.get("id")) in selected_window_ids
+    ]
+    selected_repo_ids = {str(window.get("repo_id")) for window in selected_windows if str(window.get("repo_id", "")).strip()}
+    selected_repos = [
+        deepcopy(repo)
+        for repo in snapshot.get("repos", [])
+        if str(repo.get("id")) in selected_repo_ids
+    ]
+    selected_window_edges = [
+        deepcopy(edge)
+        for edge in snapshot.get("context_window_edges", [])
+        if str(edge.get("source_window_id")) in selected_window_ids
+        and str(edge.get("target_window_id")) in selected_window_ids
+    ]
+
+    filtered = deepcopy(snapshot)
+    filtered["nodes"] = selected_nodes
+    filtered["edges"] = selected_edges
+    filtered["repos"] = selected_repos
+    filtered["context_windows"] = selected_windows
+    filtered["context_window_edges"] = selected_window_edges
+    ui_state = deepcopy(snapshot.get("ui", _default_ui()))
+    positions = ui_state.get("positions", {})
+    ui_state["positions"] = {
+        node_id: value for node_id, value in positions.items() if node_id in selected_ids
+    }
+    selected_nodes_value = ui_state.get("selected_nodes", [])
+    ui_state["selected_nodes"] = [node_id for node_id in selected_nodes_value if node_id in selected_ids]
+    filtered["ui"] = ui_state
+    return filtered
+
+
+def build_abhi_document(snapshot: dict[str, Any]) -> dict[str, Any]:
+    graph_nodes = [_snapshot_node_to_abhi_node(node) for node in snapshot.get("nodes", [])]
+    graph_edges = [_snapshot_edge_to_abhi_edge(edge) for edge in snapshot.get("edges", [])]
+    document = {
+        "graph": {
+            "nodes": graph_nodes,
+            "edges": graph_edges,
+        },
+        "schema": _default_schema(),
+        "constraints": _default_constraints(),
+        "ai_rules": _default_ai_rules(),
+        "versions": _build_versions(graph_nodes, graph_edges),
+        "ui": deepcopy(snapshot.get("ui", _default_ui())),
+        "external_refs": [],
+        "chunks": _build_chunks(graph_nodes, graph_edges),
+        "queries": _default_queries(),
+        "integrity": {
+            "content_hash": "",
+            "node_count": len(graph_nodes),
+            "edge_count": len(graph_edges),
+            "last_validated": _latest_validation_timestamp(graph_nodes, graph_edges),
+            "schema_version": str(snapshot.get("schema_version", 1)),
+            "abhi_spec_version": ABHI_SPEC_VERSION,
+        },
+        "events": _default_events(),
+        "waggle": {
+            "tenant_id": str(snapshot.get("tenant_id", "")),
+            "schema_version": int(snapshot.get("schema_version", 1)),
+            "repos": deepcopy(snapshot.get("repos", [])),
+            "context_windows": deepcopy(snapshot.get("context_windows", [])),
+            "context_window_edges": deepcopy(snapshot.get("context_window_edges", [])),
+        },
+    }
+    document["integrity"]["content_hash"] = compute_abhi_hash(document)
+    return document
+
+
+def write_abhi_document(
+    snapshot: dict[str, Any],
+    *,
+    output_path: str | Path,
+) -> AbhiExportResult:
+    destination = Path(output_path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    document = build_abhi_document(snapshot)
+    destination.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    return AbhiExportResult(
+        output_path=str(destination),
+        tenant_id=str(snapshot.get("tenant_id", "")),
+        schema_version=int(snapshot.get("schema_version", 1)),
+        abhi_spec_version=ABHI_SPEC_VERSION,
+        node_count=len(document["graph"]["nodes"]),
+        edge_count=len(document["graph"]["edges"]),
+        content_hash=document["integrity"]["content_hash"],
+    )
+
+
+def load_abhi_document(input_path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(input_path).expanduser().read_text(encoding="utf-8"))
+
+
+def inspect_abhi_document(document: dict[str, Any], *, input_path: str | Path) -> AbhiInspectResult:
+    nodes = list(document.get("graph", {}).get("nodes", []))
+    edges = list(document.get("graph", {}).get("edges", []))
+    node_types = sorted({str(node.get("type", "")).strip() for node in nodes if str(node.get("type", "")).strip()})
+    edge_types = sorted({str(edge.get("type", "")).strip() for edge in edges if str(edge.get("type", "")).strip()})
+    waggle_block = document.get("waggle", {}) if isinstance(document.get("waggle"), dict) else {}
+    return AbhiInspectResult(
+        input_path=str(Path(input_path).expanduser()),
+        tenant_id=str(waggle_block.get("tenant_id", "")),
+        schema_version=int(waggle_block.get("schema_version", 1)),
+        abhi_spec_version=str(document.get("integrity", {}).get("abhi_spec_version", "")) or ABHI_SPEC_VERSION,
+        node_count=len(nodes),
+        edge_count=len(edges),
+        node_types=node_types,
+        edge_types=edge_types,
+        constraint_count=len(document.get("constraints", [])),
+        version_count=len(document.get("versions", [])),
+        query_count=len(document.get("queries", {}).get("saved", [])) if isinstance(document.get("queries"), dict) else 0,
+        event_count=len(document.get("events", {})) if isinstance(document.get("events"), dict) else 0,
+        content_hash=str(document.get("integrity", {}).get("content_hash", "")),
+    )
+
+
+def execute_abhi_query(
+    document: dict[str, Any],
+    *,
+    query_id: str = "",
+    query_text: str = "",
+) -> dict[str, Any]:
+    saved_queries = document.get("queries", {}).get("saved", []) if isinstance(document.get("queries"), dict) else []
+    selected_query = None
+    if query_id.strip():
+        selected_query = next(
+            (item for item in saved_queries if str(item.get("id", "")).strip() == query_id.strip()),
+            None,
+        )
+        if selected_query is None:
+            raise ValueError(f"Unknown ABHI query id: {query_id}")
+    effective_query = str(query_text or (selected_query or {}).get("query", "")).strip()
+    if not effective_query:
+        raise ValueError("ABHI query text cannot be empty.")
+
+    nodes = list(document.get("graph", {}).get("nodes", []))
+    edges = list(document.get("graph", {}).get("edges", []))
+    node_by_id = {str(node.get("id", "")).strip(): node for node in nodes}
+    normalized = effective_query.lower()
+
+    matched_nodes: list[dict[str, Any]] = []
+    matched_edges: list[dict[str, Any]] = []
+
+    if normalized.startswith("find nodes where"):
+        matched_nodes = _execute_abhi_node_query(nodes, effective_query)
+        matched_ids = {str(node.get("id", "")).strip() for node in matched_nodes}
+        matched_edges = [
+            edge
+            for edge in edges
+            if str(edge.get("from", "")).strip() in matched_ids and str(edge.get("to", "")).strip() in matched_ids
+        ]
+    elif normalized.startswith("find paths where"):
+        matched_nodes, matched_edges = _execute_abhi_path_query(nodes, edges, effective_query)
+    else:
+        raise ValueError("Unsupported ABHI query. Supported forms start with FIND nodes WHERE or FIND paths WHERE.")
+
+    return {
+        "query_id": str((selected_query or {}).get("id", "")).strip(),
+        "name": str((selected_query or {}).get("name", "")).strip(),
+        "query": effective_query,
+        "summary": (
+            f"Matched {len(matched_nodes)} node{'s' if len(matched_nodes) != 1 else ''} and "
+            f"{len(matched_edges)} edge{'s' if len(matched_edges) != 1 else ''}."
+        ),
+        "nodes": matched_nodes,
+        "edges": matched_edges,
+        "node_labels": {
+            node_id: str(node.get("metadata", {}).get("label") or node.get("content", "")).strip()
+            for node_id, node in node_by_id.items()
+            if node_id in {str(item.get("id", "")).strip() for item in matched_nodes}
+        },
+    }
+
+
+def validate_abhi_document(document: dict[str, Any], *, input_path: str | Path) -> AbhiValidationResult:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for required_section in (
+        "graph",
+        "schema",
+        "constraints",
+        "ai_rules",
+        "versions",
+        "ui",
+        "external_refs",
+        "chunks",
+        "queries",
+        "integrity",
+        "events",
+    ):
+        if required_section not in document:
+            errors.append(f"Missing top-level section: {required_section}")
+
+    graph = document.get("graph", {})
+    schema = document.get("schema", {})
+    constraints = document.get("constraints", [])
+    integrity = document.get("integrity", {})
+    nodes = list(graph.get("nodes", [])) if isinstance(graph, dict) else []
+    edges = list(graph.get("edges", [])) if isinstance(graph, dict) else []
+    node_ids: set[str] = set()
+    duplicate_contents: set[tuple[str, str]] = set()
+    content_keys: set[tuple[str, str]] = set()
+    outgoing_edge_counts: dict[str, int] = {}
+
+    node_type_schema = schema.get("node_types", {}) if isinstance(schema, dict) else {}
+    edge_type_schema = schema.get("edge_types", {}) if isinstance(schema, dict) else {}
+
+    for node in nodes:
+        node_id = str(node.get("id", "")).strip()
+        node_type = str(node.get("type", "")).strip()
+        content = str(node.get("content", "")).strip()
+        if not node_id:
+            errors.append("Node is missing required field: id")
+            continue
+        if node_id in node_ids:
+            errors.append(f"Duplicate node id: {node_id}")
+        node_ids.add(node_id)
+        if not node_type:
+            errors.append(f"Node {node_id} is missing required field: type")
+        if not content:
+            errors.append(f"Node {node_id} is missing required field: content")
+        if node_type and node_type not in node_type_schema:
+            warnings.append(f"Node {node_id} uses undeclared node type '{node_type}'.")
+        schema_entry = node_type_schema.get(node_type, {})
+        for required_field in schema_entry.get("must_have", []):
+            if not _node_has_field(node, required_field):
+                errors.append(f"Node {node_id} of type '{node_type}' is missing required field '{required_field}'.")
+        content_key = (node_type, normalize_text(content))
+        if content_key in content_keys:
+            duplicate_contents.add(content_key)
+        content_keys.add(content_key)
+
+    max_edges_per_node = _constraint_limit(constraints, "max_edges_per_node")
+    for edge in edges:
+        edge_id = str(edge.get("id", "")).strip()
+        source_id = str(edge.get("from", "")).strip()
+        target_id = str(edge.get("to", "")).strip()
+        edge_type = str(edge.get("type", "")).strip()
+        if not edge_id:
+            errors.append("Edge is missing required field: id")
+        if not source_id or not target_id:
+            errors.append(f"Edge {edge_id or '<missing-id>'} is missing 'from' or 'to'.")
+            continue
+        if source_id == target_id:
+            errors.append(f"Edge {edge_id or '<missing-id>'} violates no_self_loop.")
+        if source_id not in node_ids:
+            errors.append(f"Edge {edge_id or '<missing-id>'} references missing source node '{source_id}'.")
+        if target_id not in node_ids:
+            errors.append(f"Edge {edge_id or '<missing-id>'} references missing target node '{target_id}'.")
+        if edge_type and edge_type not in edge_type_schema:
+            warnings.append(f"Edge {edge_id or '<missing-id>'} uses undeclared edge type '{edge_type}'.")
+        outgoing_edge_counts[source_id] = outgoing_edge_counts.get(source_id, 0) + 1
+        edge_schema = edge_type_schema.get(edge_type, {})
+        source_type = _node_type_by_id(nodes, source_id)
+        target_type = _node_type_by_id(nodes, target_id)
+        valid_from = set(edge_schema.get("valid_from", []))
+        valid_to = set(edge_schema.get("valid_to", []))
+        if valid_from and source_type and source_type not in valid_from:
+            errors.append(
+                f"Edge {edge_id or '<missing-id>'} type '{edge_type}' cannot originate from node type '{source_type}'."
+            )
+        if valid_to and target_type and target_type not in valid_to:
+            errors.append(
+                f"Edge {edge_id or '<missing-id>'} type '{edge_type}' cannot target node type '{target_type}'."
+            )
+        if edge_type == "contradicts" and source_type == "decision" and target_type != "decision":
+            errors.append(
+                f"Edge {edge_id or '<missing-id>'} violates custom contradiction rule: decision contradicts must target a decision."
+            )
+
+    if duplicate_contents:
+        for node_type, content in sorted(duplicate_contents):
+            errors.append(f"Duplicate content for node type '{node_type}': {content}")
+
+    if max_edges_per_node is not None:
+        for node_id, count in outgoing_edge_counts.items():
+            if count > max_edges_per_node:
+                errors.append(f"Node {node_id} exceeds max_edges_per_node ({count} > {max_edges_per_node}).")
+
+    expected_hash = str(integrity.get("content_hash", "")).strip()
+    actual_hash = compute_abhi_hash(document)
+    if not expected_hash:
+        errors.append("Integrity hash is missing.")
+    elif expected_hash != actual_hash:
+        errors.append("Integrity hash mismatch.")
+
+    expected_node_count = integrity.get("node_count")
+    expected_edge_count = integrity.get("edge_count")
+    if expected_node_count is not None and int(expected_node_count) != len(nodes):
+        errors.append(f"Integrity node_count mismatch ({expected_node_count} != {len(nodes)}).")
+    if expected_edge_count is not None and int(expected_edge_count) != len(edges):
+        errors.append(f"Integrity edge_count mismatch ({expected_edge_count} != {len(edges)}).")
+
+    return AbhiValidationResult(
+        input_path=str(Path(input_path).expanduser()),
+        valid=not errors,
+        errors=errors,
+        warnings=warnings,
+        node_count=len(nodes),
+        edge_count=len(edges),
+        content_hash=expected_hash,
+        abhi_spec_version=str(integrity.get("abhi_spec_version", "")) or ABHI_SPEC_VERSION,
+    )
+
+
+def abhi_to_snapshot(document: dict[str, Any], *, fallback_tenant_id: str) -> dict[str, Any]:
+    waggle_block = document.get("waggle", {}) if isinstance(document.get("waggle"), dict) else {}
+    tenant_id = str(waggle_block.get("tenant_id") or fallback_tenant_id)
+    nodes = [_abhi_node_to_snapshot_node(node, tenant_id=tenant_id) for node in document.get("graph", {}).get("nodes", [])]
+    edges = [_abhi_edge_to_snapshot_edge(edge, tenant_id=tenant_id) for edge in document.get("graph", {}).get("edges", [])]
+    return {
+        "schema_version": int(waggle_block.get("schema_version", 1)),
+        "tenant_id": tenant_id,
+        "repos": deepcopy(waggle_block.get("repos", [])),
+        "context_windows": deepcopy(waggle_block.get("context_windows", [])),
+        "context_window_edges": deepcopy(waggle_block.get("context_window_edges", [])),
+        "nodes": nodes,
+        "edges": edges,
+        "ui": deepcopy(document.get("ui", _default_ui())),
+    }
+
+
+def compute_abhi_hash(document: dict[str, Any]) -> str:
+    payload = {
+        "graph": document.get("graph", {}),
+        "schema": document.get("schema", {}),
+        "constraints": document.get("constraints", []),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _snapshot_node_to_abhi_node(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(node.get("metadata", {}))
+    metadata.update(
+        {
+            "label": node.get("label", ""),
+            "tenant_id": node.get("tenant_id", ""),
+            "agent_id": node.get("agent_id", ""),
+            "project": node.get("project", ""),
+            "session_id": node.get("session_id", ""),
+            "context_window_id": node.get("context_window_id"),
+            "tags": list(node.get("tags", [])),
+            "source_prompt": node.get("source_prompt", ""),
+            "evidence_records": deepcopy(node.get("evidence_records", [])),
+            "valid_from": node.get("valid_from"),
+            "valid_to": node.get("valid_to"),
+            "created_at": node.get("created_at"),
+            "updated_at": node.get("updated_at"),
+            "ts": node.get("updated_at") or node.get("created_at"),
+            "access_count": int(node.get("access_count", 0)),
+        }
+    )
+    return {
+        "id": node["id"],
+        "type": node.get("node_type", "note"),
+        "content": node.get("content", ""),
+        "metadata": metadata,
+    }
+
+
+def _snapshot_edge_to_abhi_edge(edge: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(edge.get("metadata", {}))
+    metadata.update(
+        {
+            "tenant_id": edge.get("tenant_id", ""),
+            "weight": float(edge.get("weight", 1.0)),
+            "created_at": edge.get("created_at"),
+        }
+    )
+    return {
+        "id": edge["id"],
+        "from": edge.get("source_id", ""),
+        "to": edge.get("target_id", ""),
+        "type": edge.get("relationship", ""),
+        "metadata": metadata,
+    }
+
+
+def _abhi_node_to_snapshot_node(node: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
+    metadata = dict(node.get("metadata", {}))
+    node_type = _normalize_snapshot_node_type(str(node.get("type", "")).strip() or "note")
+    created_at = str(metadata.get("created_at") or metadata.get("ts") or "")
+    updated_at = str(metadata.get("updated_at") or metadata.get("ts") or created_at)
+    return {
+        "id": str(node.get("id", "")).strip(),
+        "tenant_id": tenant_id,
+        "agent_id": str(metadata.get("agent_id", "")),
+        "project": str(metadata.get("project", "")),
+        "session_id": str(metadata.get("session_id", "")),
+        "context_window_id": metadata.get("context_window_id"),
+        "label": str(metadata.get("label") or _derive_label(str(node.get("content", "")))),
+        "content": str(node.get("content", "")).strip(),
+        "node_type": node_type,
+        "tags": list(metadata.get("tags", []) or []),
+        "source_prompt": str(metadata.get("source_prompt", "")),
+        "metadata": {
+            **metadata,
+            "abhi_original_type": str(node.get("type", "")).strip() or node_type,
+        },
+        "evidence_records": deepcopy(metadata.get("evidence_records", [])),
+        "valid_from": metadata.get("valid_from"),
+        "valid_to": metadata.get("valid_to"),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "access_count": int(metadata.get("access_count", 0) or 0),
+    }
+
+
+def _abhi_edge_to_snapshot_edge(edge: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
+    metadata = dict(edge.get("metadata", {}))
+    return {
+        "id": str(edge.get("id", "")).strip(),
+        "tenant_id": tenant_id,
+        "source_id": str(edge.get("from", "")).strip(),
+        "target_id": str(edge.get("to", "")).strip(),
+        "relationship": str(edge.get("type", "")).strip(),
+        "weight": float(metadata.get("weight", 1.0) or 1.0),
+        "metadata": metadata,
+        "created_at": metadata.get("created_at", ""),
+    }
+
+
+def _default_schema() -> dict[str, Any]:
+    node_types = {
+        "decision": {"must_have": ["content", "ts"], "optional": ["label", "confidence", "source", "tags"]},
+        "reason": {"must_have": ["content"], "optional": ["label", "weight", "tags"]},
+        "entity": {"must_have": ["content"], "optional": ["label", "entity_type", "aliases", "tags"]},
+        "fact": {"must_have": ["content"], "optional": ["label", "tags"]},
+        "concept": {"must_have": ["content"], "optional": ["label", "tags"]},
+        "preference": {"must_have": ["content"], "optional": ["label", "tags"]},
+        "question": {"must_have": ["content"], "optional": ["label", "tags"]},
+        "note": {"must_have": ["content"], "optional": ["label", "tags"]},
+        "constraint": {"must_have": ["content"], "optional": ["label", "tags"]},
+        "goal": {"must_have": ["content"], "optional": ["label", "tags"]},
+    }
+    all_node_types = list(ABHI_NODE_TYPES)
+    edge_types = {
+        "depends_on": {"valid_from": ["decision", "goal"], "valid_to": ["reason", "fact", "constraint"]},
+        "contradicts": {"valid_from": ["decision", "fact"], "valid_to": ["decision", "fact"]},
+    }
+    for edge_type in ABHI_EDGE_TYPES:
+        edge_types.setdefault(edge_type, {"valid_from": all_node_types, "valid_to": all_node_types})
+    return {
+        "node_types": node_types,
+        "edge_types": edge_types,
+    }
+
+
+def _default_constraints() -> list[dict[str, Any]]:
+    return [
+        {"rule": "no_self_loop", "description": "No node may have an edge pointing to itself"},
+        {"rule": "edge_type_match", "description": "Edge endpoints must match valid_from/valid_to in schema"},
+        {"rule": "required_fields", "description": "Nodes must have all must_have fields from schema"},
+        {
+            "rule": "unique_content_per_type",
+            "scope": "project",
+            "description": "No two nodes of the same type may have identical content",
+        },
+        {"rule": "max_edges_per_node", "limit": 500, "description": "Prevent runaway linking"},
+        {
+            "rule": "custom",
+            "expression": "IF node.type == 'decision' AND edge.type == 'contradicts' THEN target.type == 'decision'",
+            "description": "Only decisions can contradict other decisions",
+        },
+    ]
+
+
+def _default_ai_rules() -> dict[str, Any]:
+    return {
+        "merge_if_similarity": 0.85,
+        "dedup_scope": "project",
+        "auto_link_patterns": [
+            {
+                "from_type": "decision",
+                "to_type": "reason",
+                "edge_type": "depends_on",
+                "condition": "semantic_similarity > 0.8",
+            },
+            {
+                "from_type": "entity",
+                "to_type": "entity",
+                "edge_type": "relates_to",
+                "condition": "co_occurrence > 3",
+            },
+        ],
+        "inference_hints": [
+            "If a new decision contradicts an existing decision, create a 'contradicts' edge automatically",
+            "If an entity appears in multiple decisions, create 'part_of' edges to a shared context node",
+        ],
+        "extraction_instructions": (
+            "When processing conversation, extract: all named entities, all decisions with stated reasons, "
+            "all preferences, all constraints mentioned by the user, and all explicit corrections or contradictions "
+            "to prior statements."
+        ),
+    }
+
+
+def _build_versions(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    changes = [
+        {
+            "op": "add_node",
+            "node_id": node["id"],
+            "snapshot": {"type": node["type"], "content": node["content"]},
+        }
+        for node in nodes
+    ]
+    changes.extend(
+        {
+            "op": "add_edge",
+            "edge_id": edge["id"],
+            "from": edge["from"],
+            "to": edge["to"],
+            "type": edge["type"],
+        }
+        for edge in edges
+    )
+    return [
+        {
+            "id": "v1",
+            "ts": _latest_validation_timestamp(nodes, edges),
+            "author": "waggle-auto",
+            "changes": changes,
+            "message": "Initial ABHI export from Waggle memory graph",
+        }
+    ]
+
+
+def _default_ui() -> dict[str, Any]:
+    return {
+        "positions": {},
+        "zoom": 1.0,
+        "viewport": {"center_x": 0, "center_y": 0},
+        "groups": [],
+        "collapsed_groups": [],
+        "selected_nodes": [],
+    }
+
+
+def _build_chunks(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "chunk_index": {
+            "full_graph": {
+                "node_ids": [node["id"] for node in nodes],
+                "edge_ids": [edge["id"] for edge in edges],
+                "byte_offset": 0,
+                "byte_length": 0,
+            }
+        },
+        "load_strategy": "full",
+        "preload": ["full_graph"],
+    }
+
+
+def _default_queries() -> dict[str, Any]:
+    return {
+        "saved": [
+            {
+                "id": "q1",
+                "name": "Recent changes",
+                "query": "FIND nodes WHERE ts > NOW() - 7d ORDER BY ts DESC",
+            },
+            {
+                "id": "q2",
+                "name": "Contradiction chains",
+                "query": "FIND paths WHERE edge.type='contradicts' DEPTH <= 3",
+            },
+        ],
+        "auto_run_on_open": ["q1"],
+    }
+
+
+def _default_events() -> dict[str, Any]:
+    return {
+        "on_add_node": ["validate_constraints", "auto_link", "update_hash"],
+        "on_add_edge": ["validate_constraints", "check_cycles"],
+        "on_contradiction_detected": ["flag_for_review", "notify"],
+        "on_import": ["validate_schema", "verify_hash", "run_dedup"],
+        "on_export": ["compute_hash", "snapshot_version", "strip_ui_state"],
+        "on_query": ["log_access", "update_relevance_scores"],
+        "on_merge": ["three_way_diff", "resolve_conflicts", "recompute_hash"],
+    }
+
+
+def _latest_validation_timestamp(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> str:
+    timestamps = []
+    for node in nodes:
+        metadata = node.get("metadata", {})
+        timestamps.extend([metadata.get("updated_at"), metadata.get("created_at"), metadata.get("ts")])
+    for edge in edges:
+        timestamps.append(edge.get("metadata", {}).get("created_at"))
+    normalized = [str(ts).strip() for ts in timestamps if str(ts or "").strip()]
+    return max(normalized) if normalized else ""
+
+
+def _node_has_field(node: dict[str, Any], field: str) -> bool:
+    if field in node and str(node.get(field, "")).strip():
+        return True
+    metadata = node.get("metadata", {})
+    if isinstance(metadata, dict) and str(metadata.get(field, "")).strip():
+        return True
+    return False
+
+
+def _node_type_by_id(nodes: list[dict[str, Any]], node_id: str) -> str:
+    for node in nodes:
+        if str(node.get("id", "")).strip() == node_id:
+            return str(node.get("type", "")).strip()
+    return ""
+
+
+def _constraint_limit(constraints: list[dict[str, Any]], rule_name: str) -> int | None:
+    for constraint in constraints:
+        if str(constraint.get("rule", "")).strip() == rule_name:
+            limit = constraint.get("limit")
+            return int(limit) if limit is not None else None
+    return None
+
+
+def _normalize_snapshot_node_type(node_type: str) -> str:
+    normalized = node_type.strip().lower()
+    if normalized in {"fact", "entity", "concept", "preference", "decision", "question", "note"}:
+        return normalized
+    if normalized == "reason":
+        return "fact"
+    if normalized in {"constraint", "goal"}:
+        return "concept"
+    return "note"
+
+
+def _derive_label(content: str) -> str:
+    trimmed = content.strip()
+    return trimmed[:80] if len(trimmed) > 80 else trimmed
+
+
+def normalize_text(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _execute_abhi_node_query(nodes: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    selected = list(nodes)
+    lowered = query.lower()
+
+    type_match = _extract_single_quoted_value(query, "type=")
+    if type_match:
+        selected = [node for node in selected if str(node.get("type", "")).strip().lower() == type_match.lower()]
+
+    content_contains = _extract_single_quoted_value(query, "content contains")
+    if content_contains:
+        needle = normalize_text(content_contains)
+        selected = [
+            node
+            for node in selected
+            if needle in normalize_text(str(node.get("content", "")))
+            or needle in normalize_text(str(node.get("metadata", {}).get("label", "")))
+        ]
+
+    days = _extract_now_minus_days(lowered)
+    if days is not None:
+        selected = [node for node in selected if _node_is_within_days(node, days)]
+
+    if "order by ts desc" in lowered:
+        selected.sort(key=_node_timestamp_for_sort, reverse=True)
+    return selected
+
+
+def _execute_abhi_path_query(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    query: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    lowered = query.lower()
+    edge_type = _extract_single_quoted_value(query, "edge.type=")
+    depth = _extract_depth_limit(lowered)
+    if not edge_type:
+        raise ValueError("Path queries must specify edge.type='...'.")
+    if depth is None:
+        depth = 3
+
+    matched_edges = [
+        edge for edge in edges if str(edge.get("type", "")).strip().lower() == edge_type.lower()
+    ]
+    if depth <= 1:
+        matched_ids = {
+            str(edge.get("from", "")).strip() for edge in matched_edges
+        } | {
+            str(edge.get("to", "")).strip() for edge in matched_edges
+        }
+        matched_nodes = [node for node in nodes if str(node.get("id", "")).strip() in matched_ids]
+        return matched_nodes, matched_edges
+
+    adjacency: dict[str, list[dict[str, Any]]] = {}
+    for edge in matched_edges:
+        adjacency.setdefault(str(edge.get("from", "")).strip(), []).append(edge)
+
+    visited_edges: dict[str, dict[str, Any]] = {}
+    visited_nodes: set[str] = set()
+    for node in nodes:
+        start_id = str(node.get("id", "")).strip()
+        frontier = [(start_id, 0)]
+        seen = {start_id}
+        while frontier:
+            current, level = frontier.pop(0)
+            if level >= depth:
+                continue
+            for edge in adjacency.get(current, []):
+                edge_id = str(edge.get("id", "")).strip()
+                target_id = str(edge.get("to", "")).strip()
+                visited_edges[edge_id] = edge
+                visited_nodes.add(current)
+                visited_nodes.add(target_id)
+                if target_id not in seen:
+                    seen.add(target_id)
+                    frontier.append((target_id, level + 1))
+    matched_nodes = [node for node in nodes if str(node.get("id", "")).strip() in visited_nodes]
+    return matched_nodes, list(visited_edges.values())
+
+
+def _extract_single_quoted_value(query: str, marker: str) -> str:
+    lowered = query.lower()
+    index = lowered.find(marker.lower())
+    if index < 0:
+        return ""
+    start = query.find("'", index)
+    if start < 0:
+        return ""
+    end = query.find("'", start + 1)
+    if end < 0:
+        return ""
+    return query[start + 1 : end]
+
+
+def _extract_now_minus_days(query: str) -> int | None:
+    marker = "now() - "
+    index = query.find(marker)
+    if index < 0:
+        return None
+    suffix = query[index + len(marker) :]
+    digits = []
+    for char in suffix:
+        if char.isdigit():
+            digits.append(char)
+        elif digits:
+            break
+    if not digits:
+        return None
+    return int("".join(digits))
+
+
+def _extract_depth_limit(query: str) -> int | None:
+    marker = "depth <="
+    index = query.find(marker)
+    if index < 0:
+        return None
+    suffix = query[index + len(marker) :]
+    digits = []
+    for char in suffix:
+        if char.isdigit():
+            digits.append(char)
+        elif digits:
+            break
+    if not digits:
+        return None
+    return int("".join(digits))
+
+
+def _node_is_within_days(node: dict[str, Any], days: int) -> bool:
+    raw = _node_timestamp_for_sort(node)
+    if not raw:
+        return False
+    try:
+        timestamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    now = datetime.now(timestamp.tzinfo or None)
+    delta = now - timestamp
+    return delta.days <= days
+
+
+def _node_timestamp_for_sort(node: dict[str, Any]) -> str:
+    metadata = node.get("metadata", {}) if isinstance(node.get("metadata"), dict) else {}
+    return str(metadata.get("ts") or metadata.get("updated_at") or metadata.get("created_at") or "").strip()

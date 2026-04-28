@@ -9,6 +9,7 @@ from uuid import uuid4
 import networkx as nx
 import numpy as np
 
+from waggle.abhi import execute_abhi_query, load_abhi_document
 from waggle.graph import MemoryGraph
 from waggle.models import NodeType, RelationType
 
@@ -371,6 +372,134 @@ def test_export_and_import_backup_round_trip(tmp_path: Path) -> None:
     assert imported_result.edges_created == 1
     assert imported.get_stats().total_nodes == 2
     assert imported.get_stats().total_edges == 1
+
+
+def test_export_validate_and_import_abhi_round_trip(tmp_path: Path) -> None:
+    source = make_graph(tmp_path / "source")
+    target = make_graph(tmp_path / "target")
+    decision = source.add_node(
+        label="Use PostgreSQL",
+        content="Use PostgreSQL for production.",
+        node_type=NodeType.DECISION,
+    ).node
+    reason = source.add_node(
+        label="Replication pain",
+        content="MySQL replication has been painful.",
+        node_type=NodeType.FACT,
+    ).node
+    source.add_edge(
+        source_id=decision.id,
+        target_id=reason.id,
+        relationship=RelationType.DEPENDS_ON,
+    )
+
+    exported = source.export_abhi(output_path=tmp_path / "memory.abhi")
+    validation = source.validate_abhi(input_path=exported.output_path)
+    imported = target.import_abhi(input_path=exported.output_path)
+
+    payload = json.loads(Path(exported.output_path).read_text(encoding="utf-8"))
+
+    assert payload["graph"]["nodes"]
+    assert payload["schema"]["node_types"]["decision"]["must_have"] == ["content", "ts"]
+    assert payload["integrity"]["content_hash"].startswith("sha256:")
+    assert validation.valid is True
+    assert imported.hash_verified is True
+    assert imported.nodes_created == 2
+    assert imported.edges_created == 1
+    assert target.get_stats().total_nodes == 2
+
+
+def test_update_and_delete_edge(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    source = graph.add_node(
+        label="Source",
+        content="Source node",
+        node_type=NodeType.NOTE,
+    ).node
+    target = graph.add_node(
+        label="Target",
+        content="Target node",
+        node_type=NodeType.NOTE,
+    ).node
+    replacement = graph.add_node(
+        label="Replacement",
+        content="Replacement node",
+        node_type=NodeType.NOTE,
+    ).node
+    edge = graph.add_edge(
+        source_id=source.id,
+        target_id=target.id,
+        relationship=RelationType.RELATES_TO,
+    )
+
+    updated = graph.update_edge(
+        edge_id=edge.id,
+        target_id=replacement.id,
+        relationship=RelationType.DEPENDS_ON,
+        weight=0.4,
+    )
+    deleted = graph.delete_edge(edge_id=edge.id)
+
+    assert updated.target_id == replacement.id
+    assert updated.relationship == RelationType.DEPENDS_ON.value
+    assert updated.weight == 0.4
+    assert deleted.id == edge.id
+    assert graph.get_stats().total_edges == 0
+
+
+def test_ui_state_persists_and_round_trips_through_abhi(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path / "source")
+    imported = make_graph(tmp_path / "target")
+    node = graph.add_node(
+        label="Canvas Node",
+        content="Node with saved position",
+        node_type=NodeType.NOTE,
+        project="studio",
+    ).node
+    graph.save_ui_state(
+        project="studio",
+        positions={node.id: {"x": 111, "y": 222}},
+        zoom=1.25,
+        viewport={"center_x": 111, "center_y": 222},
+        selected_nodes=[node.id],
+    )
+
+    snapshot = graph.get_graph_snapshot(project="studio")
+    exported = graph.export_abhi(output_path=tmp_path / "memory.abhi", project="studio")
+    imported.import_abhi(input_path=exported.output_path)
+    imported_ui = imported.get_ui_state()
+
+    assert snapshot["ui"]["positions"][node.id] == {"x": 111, "y": 222}
+    payload = json.loads(Path(exported.output_path).read_text(encoding="utf-8"))
+    assert payload["ui"]["positions"][node.id] == {"x": 111, "y": 222}
+    assert imported_ui["positions"]
+    assert imported_ui["zoom"] == 1.25
+
+
+def test_execute_abhi_query_matches_recent_and_filtered_nodes(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+    graph.add_node(
+        label="Database decision",
+        content="Use PostgreSQL for the main database.",
+        node_type=NodeType.DECISION,
+        project="studio",
+    )
+    graph.add_node(
+        label="Frontend note",
+        content="Keep the browser graph editor responsive.",
+        node_type=NodeType.NOTE,
+        project="studio",
+    )
+    exported = graph.export_abhi(output_path=tmp_path / "memory.abhi", project="studio")
+    document = load_abhi_document(exported.output_path)
+
+    filtered = execute_abhi_query(document, query_text="FIND nodes WHERE type='decision' AND content CONTAINS 'database'")
+    recent = execute_abhi_query(document, query_id="q1")
+
+    assert len(filtered["nodes"]) == 1
+    assert filtered["nodes"][0]["type"] == "decision"
+    assert recent["query_id"] == "q1"
+    assert len(recent["nodes"]) >= 1
 
 
 def test_export_graph_html_creates_visualization_file(tmp_path: Path) -> None:

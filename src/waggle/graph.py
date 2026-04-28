@@ -19,6 +19,15 @@ from uuid import uuid4
 import networkx as nx
 import numpy as np
 
+from waggle.abhi import (
+    ABHI_SPEC_VERSION,
+    abhi_to_snapshot,
+    filter_snapshot_by_scope,
+    inspect_abhi_document,
+    load_abhi_document,
+    validate_abhi_document,
+    write_abhi_document,
+)
 from waggle.auth import generate_api_key, hash_api_key, verify_api_key
 from waggle.context_bundle import build_context_bundle, build_query_summary, export_context_bundle_files
 from waggle.embeddings import EmbeddingModel
@@ -59,6 +68,10 @@ from waggle.markdown_vault import (
     vault_filename,
 )
 from waggle.models import (
+    AbhiExportResult,
+    AbhiImportResult,
+    AbhiInspectResult,
+    AbhiValidationResult,
     ApiKeyCreateResult,
     ApiKeyRecord,
     BackupResult,
@@ -101,7 +114,7 @@ from waggle.models import (
     utc_now,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 LOGGER = logging.getLogger(__name__)
 
@@ -363,6 +376,21 @@ CREATE TABLE IF NOT EXISTS transcript_records (
     metadata TEXT DEFAULT '{}',
     message_identity TEXT DEFAULT NULL
 );
+
+CREATE TABLE IF NOT EXISTS graph_ui_state (
+    tenant_id TEXT NOT NULL DEFAULT 'local-default',
+    agent_id TEXT DEFAULT '',
+    project TEXT DEFAULT '',
+    session_id TEXT DEFAULT '',
+    positions TEXT DEFAULT '{}',
+    zoom REAL DEFAULT 1.0,
+    viewport TEXT DEFAULT '{}',
+    groups_json TEXT DEFAULT '[]',
+    collapsed_groups TEXT DEFAULT '[]',
+    selected_nodes TEXT DEFAULT '[]',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, agent_id, project, session_id)
+);
 """
 
 INDEX_SQL = """
@@ -386,6 +414,7 @@ CREATE INDEX IF NOT EXISTS idx_context_windows_status ON context_windows(status)
 CREATE INDEX IF NOT EXISTS idx_cw_edges_source ON context_window_edges(source_window_id);
 CREATE INDEX IF NOT EXISTS idx_cw_edges_target ON context_window_edges(target_window_id);
 CREATE INDEX IF NOT EXISTS idx_cw_edges_type ON context_window_edges(edge_type);
+CREATE INDEX IF NOT EXISTS idx_graph_ui_scope ON graph_ui_state(tenant_id, project, agent_id, session_id);
 """
 
 RELATION_WEIGHTS: dict[str, float] = {
@@ -594,6 +623,110 @@ class MemoryGraph:
             created_at=_parse_datetime(row["created_at"]),
         )
 
+    @staticmethod
+    def _normalize_ui_scope(*, project: str = "", agent_id: str = "", session_id: str = "") -> tuple[str, str, str]:
+        return (project.strip(), agent_id.strip(), session_id.strip())
+
+    def get_ui_state(
+        self,
+        *,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        normalized_project, normalized_agent, normalized_session = self._normalize_ui_scope(
+            project=project, agent_id=agent_id, session_id=session_id
+        )
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT positions, zoom, viewport, groups_json, collapsed_groups, selected_nodes
+                FROM graph_ui_state
+                WHERE tenant_id = ? AND project = ? AND agent_id = ? AND session_id = ?
+                """,
+                (self.tenant_id, normalized_project, normalized_agent, normalized_session),
+            ).fetchone()
+        if row is None:
+            return {
+                "positions": {},
+                "zoom": 1.0,
+                "viewport": {"center_x": 0, "center_y": 0},
+                "groups": [],
+                "collapsed_groups": [],
+                "selected_nodes": [],
+            }
+        return {
+            "positions": json.loads(row["positions"] or "{}"),
+            "zoom": float(row["zoom"] if row["zoom"] is not None else 1.0),
+            "viewport": json.loads(row["viewport"] or "{}") or {"center_x": 0, "center_y": 0},
+            "groups": json.loads(row["groups_json"] or "[]"),
+            "collapsed_groups": json.loads(row["collapsed_groups"] or "[]"),
+            "selected_nodes": json.loads(row["selected_nodes"] or "[]"),
+        }
+
+    def save_ui_state(
+        self,
+        *,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+        positions: dict[str, Any] | None = None,
+        zoom: float | None = None,
+        viewport: dict[str, Any] | None = None,
+        groups: list[dict[str, Any]] | None = None,
+        collapsed_groups: list[str] | None = None,
+        selected_nodes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_project, normalized_agent, normalized_session = self._normalize_ui_scope(
+            project=project, agent_id=agent_id, session_id=session_id
+        )
+        current = self.get_ui_state(
+            project=normalized_project,
+            agent_id=normalized_agent,
+            session_id=normalized_session,
+        )
+        merged = {
+            "positions": positions if positions is not None else current["positions"],
+            "zoom": float(zoom if zoom is not None else current["zoom"]),
+            "viewport": viewport if viewport is not None else current["viewport"],
+            "groups": groups if groups is not None else current["groups"],
+            "collapsed_groups": collapsed_groups if collapsed_groups is not None else current["collapsed_groups"],
+            "selected_nodes": selected_nodes if selected_nodes is not None else current["selected_nodes"],
+        }
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO graph_ui_state (
+                    tenant_id, agent_id, project, session_id,
+                    positions, zoom, viewport, groups_json, collapsed_groups, selected_nodes, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, agent_id, project, session_id)
+                DO UPDATE SET
+                    positions = excluded.positions,
+                    zoom = excluded.zoom,
+                    viewport = excluded.viewport,
+                    groups_json = excluded.groups_json,
+                    collapsed_groups = excluded.collapsed_groups,
+                    selected_nodes = excluded.selected_nodes,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self.tenant_id,
+                    normalized_agent,
+                    normalized_project,
+                    normalized_session,
+                    json.dumps(merged["positions"], sort_keys=True),
+                    merged["zoom"],
+                    json.dumps(merged["viewport"], sort_keys=True),
+                    json.dumps(merged["groups"], sort_keys=True),
+                    json.dumps(merged["collapsed_groups"], sort_keys=True),
+                    json.dumps(merged["selected_nodes"], sort_keys=True),
+                    utc_now().isoformat(),
+                ),
+            )
+        return merged
+
     def create_api_key(self, tenant_id: str, name: str = "") -> ApiKeyCreateResult:
         tenant = self.ensure_tenant(tenant_id)
         raw_api_key = generate_api_key()
@@ -715,6 +848,24 @@ class MemoryGraph:
             connection.execute(
                 "ALTER TABLE transcript_records ADD COLUMN message_identity TEXT DEFAULT NULL"
             )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_ui_state (
+                tenant_id TEXT NOT NULL DEFAULT 'local-default',
+                agent_id TEXT DEFAULT '',
+                project TEXT DEFAULT '',
+                session_id TEXT DEFAULT '',
+                positions TEXT DEFAULT '{}',
+                zoom REAL DEFAULT 1.0,
+                viewport TEXT DEFAULT '{}',
+                groups_json TEXT DEFAULT '[]',
+                collapsed_groups TEXT DEFAULT '[]',
+                selected_nodes TEXT DEFAULT '[]',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, agent_id, project, session_id)
+            )
+            """
+        )
         # Always ensure the partial unique index exists (IF NOT EXISTS is safe for reruns).
         # Must be outside the if-block so new databases (where the column comes from CREATE TABLE)
         # also get the index, not just existing databases that went through ALTER TABLE.
@@ -2423,6 +2574,69 @@ class MemoryGraph:
             )
             return updated_node
 
+    def update_edge(
+        self,
+        *,
+        edge_id: str,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        relationship: str | RelationType | None = None,
+        weight: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Edge:
+        if (
+            source_id is None
+            and target_id is None
+            and relationship is None
+            and weight is None
+            and metadata is None
+        ):
+            raise ValueError("At least one field must be provided for edge update.")
+
+        with self._lock, self._connect() as connection:
+            row = self._fetch_edge_row(connection, edge_id)
+            if row is None:
+                raise ValueError(f"Edge not found: {edge_id}")
+            edge = self._row_to_edge(row)
+            updated_edge = Edge(
+                id=edge.id,
+                tenant_id=edge.tenant_id,
+                source_id=source_id if source_id is not None else edge.source_id,
+                target_id=target_id if target_id is not None else edge.target_id,
+                relationship=relationship if relationship is not None else edge.relationship,
+                weight=weight if weight is not None else edge.weight,
+                metadata=metadata if metadata is not None else edge.metadata,
+                created_at=edge.created_at,
+            )
+            self._require_node(connection, updated_edge.source_id)
+            self._require_node(connection, updated_edge.target_id)
+            connection.execute(
+                """
+                UPDATE edges
+                SET source_id = ?, target_id = ?, relationship = ?, weight = ?, metadata = ?
+                WHERE id = ? AND tenant_id = ?
+                """,
+                (
+                    updated_edge.source_id,
+                    updated_edge.target_id,
+                    updated_edge.relationship,
+                    updated_edge.weight,
+                    _encode_metadata(updated_edge.metadata),
+                    edge_id,
+                    self.tenant_id,
+                ),
+            )
+            return updated_edge
+
+    def delete_edge(self, *, edge_id: str) -> Edge:
+        with self._lock, self._connect() as connection:
+            row = self._fetch_edge_row(connection, edge_id)
+            if row is None:
+                raise ValueError(f"Edge not found: {edge_id}")
+            edge = self._row_to_edge(row)
+            connection.execute("DELETE FROM edges WHERE id = ? AND tenant_id = ?", (edge_id, self.tenant_id))
+            return edge
+
     def delete_node(self, *, node_id: str) -> Node:
         with self._lock, self._connect() as connection:
             row = self._fetch_node_row(connection, node_id)
@@ -2807,6 +3021,39 @@ class MemoryGraph:
             edge_count=len(snapshot["edges"]),
         )
 
+    def export_abhi(
+        self,
+        *,
+        output_path: str | Path | None = None,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+    ) -> AbhiExportResult:
+        with self._lock, self._connect() as connection:
+            snapshot = self._build_backup_snapshot(connection)
+        snapshot["ui"] = self.get_ui_state(project=project, agent_id=agent_id, session_id=session_id)
+        filtered = filter_snapshot_by_scope(snapshot, project=project, agent_id=agent_id, session_id=session_id)
+        if output_path is None:
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = utc_now().strftime("%Y%m%d-%H%M%S")
+            destination = self.export_dir / f"waggle-memory-{timestamp}.abhi"
+        else:
+            destination = Path(output_path).expanduser()
+        return write_abhi_document(filtered, output_path=destination)
+
+    def get_graph_snapshot(
+        self,
+        *,
+        project: str = "",
+        agent_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            snapshot = self._build_backup_snapshot(connection)
+        filtered = filter_snapshot_by_scope(snapshot, project=project, agent_id=agent_id, session_id=session_id)
+        filtered["ui"] = self.get_ui_state(project=project, agent_id=agent_id, session_id=session_id)
+        return filtered
+
     def export_context_bundle(
         self,
         *,
@@ -3141,6 +3388,88 @@ class MemoryGraph:
                 if window_id:
                     self._update_window_node_count(connection, window_id)
                     self._mark_window_embedding_stale(connection, window_id)
+        self.save_ui_state(
+            positions=snapshot.get("ui", {}).get("positions", {}),
+            zoom=snapshot.get("ui", {}).get("zoom", 1.0),
+            viewport=snapshot.get("ui", {}).get("viewport", {"center_x": 0, "center_y": 0}),
+            groups=snapshot.get("ui", {}).get("groups", []),
+            collapsed_groups=snapshot.get("ui", {}).get("collapsed_groups", []),
+            selected_nodes=snapshot.get("ui", {}).get("selected_nodes", []),
+        )
+        return result
+
+    def validate_abhi(self, *, input_path: str | Path) -> AbhiValidationResult:
+        document = load_abhi_document(input_path)
+        return validate_abhi_document(document, input_path=input_path)
+
+    def inspect_abhi(self, *, input_path: str | Path) -> AbhiInspectResult:
+        document = load_abhi_document(input_path)
+        return inspect_abhi_document(document, input_path=input_path)
+
+    def import_abhi(self, *, input_path: str | Path) -> AbhiImportResult:
+        source = Path(input_path).expanduser()
+        document = load_abhi_document(source)
+        validation = validate_abhi_document(document, input_path=source)
+        if not validation.valid:
+            raise ValidationFailure("Invalid .abhi file: " + "; ".join(validation.errors))
+        snapshot = abhi_to_snapshot(document, fallback_tenant_id=self.tenant_id)
+
+        with self._lock, self._connect() as connection:
+            snapshot_tenant = str(snapshot.get("tenant_id") or self.tenant_id)
+            result = AbhiImportResult(
+                input_path=str(source),
+                tenant_id=self.tenant_id,
+                schema_version=int(snapshot.get("schema_version", 1)),
+                abhi_spec_version=validation.abhi_spec_version or ABHI_SPEC_VERSION,
+                hash_verified=True,
+            )
+            for raw_repo in snapshot.get("repos", []):
+                self._upsert_snapshot_repo(connection, {**raw_repo, "tenant_id": self.tenant_id})
+
+            for raw_window in snapshot.get("context_windows", []):
+                self._upsert_snapshot_context_window(connection, {**raw_window, "tenant_id": self.tenant_id})
+
+            for raw_node in snapshot.get("nodes", []):
+                raw_node = {**raw_node, "tenant_id": raw_node.get("tenant_id") or snapshot_tenant}
+                if raw_node["tenant_id"] != self.tenant_id:
+                    raw_node["tenant_id"] = self.tenant_id
+                if self._fetch_node_row(connection, raw_node["id"]) is None:
+                    self._insert_snapshot_node(connection, raw_node)
+                    result.nodes_created += 1
+                else:
+                    self._update_snapshot_node(connection, raw_node)
+                    result.nodes_updated += 1
+
+            for raw_edge in snapshot.get("edges", []):
+                raw_edge = {**raw_edge, "tenant_id": raw_edge.get("tenant_id") or snapshot_tenant}
+                if raw_edge["tenant_id"] != self.tenant_id:
+                    raw_edge["tenant_id"] = self.tenant_id
+                if self._fetch_edge_row(connection, raw_edge["id"]) is None:
+                    self._insert_snapshot_edge(connection, raw_edge)
+                    result.edges_created += 1
+                else:
+                    self._update_snapshot_edge(connection, raw_edge)
+                    result.edges_updated += 1
+
+            for raw_window_edge in snapshot.get("context_window_edges", []):
+                self._upsert_snapshot_context_window_edge(
+                    connection,
+                    {**raw_window_edge, "tenant_id": self.tenant_id},
+                )
+
+            for raw_window in snapshot.get("context_windows", []):
+                window_id = str(raw_window.get("id", "")).strip()
+                if window_id:
+                    self._update_window_node_count(connection, window_id)
+                    self._mark_window_embedding_stale(connection, window_id)
+        self.save_ui_state(
+            positions=snapshot.get("ui", {}).get("positions", {}),
+            zoom=snapshot.get("ui", {}).get("zoom", 1.0),
+            viewport=snapshot.get("ui", {}).get("viewport", {"center_x": 0, "center_y": 0}),
+            groups=snapshot.get("ui", {}).get("groups", []),
+            collapsed_groups=snapshot.get("ui", {}).get("collapsed_groups", []),
+            selected_nodes=snapshot.get("ui", {}).get("selected_nodes", []),
+        )
         return result
 
     def decompose_and_store(self, *, content: str, context: str = "") -> SubgraphResult:
