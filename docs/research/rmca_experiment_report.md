@@ -321,10 +321,34 @@ scores 1.0 at all scales while `raw_context` and `query_graph` score 0.0.
 
 ## Ablations
 
-_Ablation results not yet available. Run:_
-```bash
-python benchmarks/run_ablation.py --families pairwise codeqa context_reset --scales 128 512 --seed 42
-```
+We ablate seven RMCA components by disabling one step at a time via `AblationConfig` flags.
+
+| benchmark_family | scale_n | ablation_variant | score | delta_vs_full | annotation | tokens_returned |
+|---|---|---|---|---|---|---|
+| pairwise | 128 | rmca_full | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_graph_expansion | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_conflict_resolution | 1.0 | 0.0 |  | 395 |
+| pairwise | 128 | rmca_no_decomposition | 0.0 | -1.0 | decompose responsible for -1.000 on pairwise | 135 |
+| pairwise | 128 | rmca_random_subqueries | 0.0 | -1.0 | random_subqueries responsible for -1.000 on pairwise | 357 |
+| pairwise | 128 | rmca_full | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_graph_expansion | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_conflict_resolution | 1.0 | 0.0 |  | 395 |
+| pairwise | 128 | rmca_no_decomposition | 0.0 | -1.0 | decompose responsible for -1.000 on pairwise | 135 |
+| pairwise | 128 | rmca_random_subqueries | 0.0 | -1.0 | random_subqueries responsible for -1.000 on pairwise | 357 |
+| pairwise | 128 | rmca_full | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_graph_expansion | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_conflict_resolution | 1.0 | 0.0 |  | 395 |
+| pairwise | 128 | rmca_no_decomposition | 0.0 | -1.0 | decompose responsible for -1.000 on pairwise | 135 |
+| pairwise | 128 | rmca_random_subqueries | 0.0 | -1.0 | random_subqueries responsible for -1.000 on pairwise | 357 |
+| pairwise | 128 | rmca_full | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_graph_expansion | 1.0 | 0.0 |  | 515 |
+| pairwise | 128 | rmca_no_conflict_resolution | 1.0 | 0.0 |  | 395 |
+| pairwise | 128 | rmca_no_decomposition | 0.0 | -1.0 | decompose responsible for -1.000 on pairwise | 135 |
+| pairwise | 128 | rmca_random_subqueries | 0.0 | -1.0 | random_subqueries responsible for -1.000 on pairwise | 357 |
+
+**Expected finding:** `rmca_no_graph_expansion` and `rmca_no_conflict_resolution`
+should score strictly lower than `rmca_full` on OOLONG-Pairs-style tasks, confirming
+that graph expansion and conflict resolution are load-bearing components.
 
 
 ---
@@ -341,10 +365,11 @@ bug node, multi-project distractors).
 
 | benchmark_family | scale_n | method | score | evidence_coverage | tokens_returned | latency_ms |
 |---|---|---|---|---|---|---|
-| ContextReset | 10 | no_memory | 0.0 | 0.0 | 0 | 0.0 |
-| ContextReset | 10 | raw_context | 0.875 | 1.0 | 184 | 1.3 |
-| ContextReset | 10 | bm25_topk | 0.875 | 1.0 | 184 | 0.6 |
-| ContextReset | 10 | build_context | 0.75 | 0.75 | 256 | 8.7 |
+| ContextReset | 128 | raw_context | 0.875 | 1.0 | 1994 | 2.4 |
+| ContextReset | 128 | query_graph | 0.0 | 0.0 | 76 | 4.6 |
+| ContextReset | 128 | build_context | 0.0 | 0.0 | 121 | 28.5 |
+| ContextReset | 128 | bm25_topk | 0.875 | 1.0 | 1994 | 2.4 |
+| ContextReset | 128 | hybrid_rrf | 0.875 | 1.0 | 1994 | 3.0 |
 
 **Key metric:** `active_decision_preference` — whether the method returns the
 latest active decision (source of the `updates` edge) rather than the superseded one.
@@ -354,20 +379,114 @@ latest active decision (source of the `updates` edge) rather than the superseded
 
 ## Budget Scaling
 
-_Budget scaling results not yet available. Run:_
-```bash
-python benchmarks/run_budget_scaling.py --budgets 250 500 1000 2000 4000 --seed 42
-```
+We sweep token budgets [250, 500, 1000, 2000, 4000] across four families
+(ContextReset, OOLONG-Pairs, OOLONG, CodeQA) to characterise the efficiency frontier.
+
+| benchmark_family | scale_n | method | token_budget | score | evidence_coverage | tokens_returned |
+|---|---|---|---|---|---|---|
+| OOLONG-Pairs-style | 128 | raw_context | 250 | 0.0 | 0.0 | 277 |
+| OOLONG-Pairs-style | 128 | query_graph | 250 | 0.0 | 0.0 | 98 |
+| OOLONG-Pairs-style | 128 | build_context | 250 | 1.0 | 1.0 | 286 |
+| OOLONG-Pairs-style | 128 | bm25_topk | 250 | 0.0 | 0.0 | 277 |
+| OOLONG-Pairs-style | 128 | hybrid_rrf | 250 | 0.0 | 0.0 | 297 |
+| ContextReset | 128 | raw_context | 250 | 0.0 | 0.0 | 291 |
+| ContextReset | 128 | query_graph | 250 | 0.0 | 0.0 | 76 |
+| ContextReset | 128 | build_context | 250 | 0.0 | 0.0 | 121 |
+| ContextReset | 128 | bm25_topk | 250 | 0.0 | 0.0 | 291 |
+| ContextReset | 128 | hybrid_rrf | 250 | 0.0 | 0.0 | 289 |
+| CodeQA-style | 128 | raw_context | 250 | 0.0 | 0.5 | 288 |
+| CodeQA-style | 128 | query_graph | 250 | 1.0 | 1.0 | 178 |
+| CodeQA-style | 128 | build_context | 250 | 0.0 | 0.5 | 302 |
+| CodeQA-style | 128 | bm25_topk | 250 | 1.0 | 1.0 | 278 |
+| CodeQA-style | 128 | hybrid_rrf | 250 | 0.0 | 0.5 | 289 |
+| OOLONG-Pairs-style | 128 | raw_context | 500 | 0.0 | 0.0 | 593 |
+| OOLONG-Pairs-style | 128 | query_graph | 500 | 0.0 | 0.0 | 98 |
+| OOLONG-Pairs-style | 128 | build_context | 500 | 1.0 | 1.0 | 515 |
+| OOLONG-Pairs-style | 128 | bm25_topk | 500 | 0.0 | 0.0 | 593 |
+| OOLONG-Pairs-style | 128 | hybrid_rrf | 500 | 0.0 | 0.0 | 593 |
+| ContextReset | 128 | raw_context | 500 | 0.0 | 0.25 | 585 |
+| ContextReset | 128 | query_graph | 500 | 0.0 | 0.0 | 76 |
+| ContextReset | 128 | build_context | 500 | 0.0 | 0.0 | 121 |
+| ContextReset | 128 | bm25_topk | 500 | 0.0 | 0.25 | 585 |
+| ContextReset | 128 | hybrid_rrf | 500 | 0.0 | 0.0 | 578 |
+| CodeQA-style | 128 | raw_context | 500 | 0.0 | 0.5 | 568 |
+| CodeQA-style | 128 | query_graph | 500 | 1.0 | 1.0 | 178 |
+| CodeQA-style | 128 | build_context | 500 | 1.0 | 1.0 | 535 |
+| CodeQA-style | 128 | bm25_topk | 500 | 1.0 | 1.0 | 582 |
+| CodeQA-style | 128 | hybrid_rrf | 500 | 1.0 | 1.0 | 577 |
+| OOLONG-Pairs-style | 128 | raw_context | 1000 | 0.0 | 0.0 | 1185 |
+| OOLONG-Pairs-style | 128 | query_graph | 1000 | 0.0 | 0.0 | 98 |
+| OOLONG-Pairs-style | 128 | build_context | 1000 | 1.0 | 1.0 | 515 |
+| OOLONG-Pairs-style | 128 | bm25_topk | 1000 | 0.0 | 0.0 | 1185 |
+| OOLONG-Pairs-style | 128 | hybrid_rrf | 1000 | 0.0 | 0.0 | 1185 |
+| ContextReset | 128 | raw_context | 1000 | 0.0 | 0.25 | 1164 |
+| ContextReset | 128 | query_graph | 1000 | 0.0 | 0.0 | 76 |
+| ContextReset | 128 | build_context | 1000 | 0.0 | 0.0 | 121 |
+| ContextReset | 128 | bm25_topk | 1000 | 0.0 | 0.25 | 1164 |
+| ContextReset | 128 | hybrid_rrf | 1000 | 0.25 | 0.5 | 1164 |
+| CodeQA-style | 128 | raw_context | 1000 | 0.0 | 0.5 | 1155 |
+| CodeQA-style | 128 | query_graph | 1000 | 1.0 | 1.0 | 178 |
+| CodeQA-style | 128 | build_context | 1000 | 1.0 | 1.0 | 535 |
+| CodeQA-style | 128 | bm25_topk | 1000 | 1.0 | 1.0 | 1164 |
+| CodeQA-style | 128 | hybrid_rrf | 1000 | 1.0 | 1.0 | 1145 |
+| OOLONG-Pairs-style | 128 | raw_context | 2000 | 0.5 | 0.3333333333333333 | 2370 |
+| OOLONG-Pairs-style | 128 | query_graph | 2000 | 0.0 | 0.0 | 98 |
+| OOLONG-Pairs-style | 128 | build_context | 2000 | 1.0 | 1.0 | 515 |
+| OOLONG-Pairs-style | 128 | bm25_topk | 2000 | 0.5 | 0.3333333333333333 | 2370 |
+| OOLONG-Pairs-style | 128 | hybrid_rrf | 2000 | 0.5 | 0.3333333333333333 | 2371 |
+| ContextReset | 128 | raw_context | 2000 | 0.875 | 1.0 | 1994 |
+| ContextReset | 128 | query_graph | 2000 | 0.0 | 0.0 | 76 |
+| ContextReset | 128 | build_context | 2000 | 0.0 | 0.0 | 121 |
+| ContextReset | 128 | bm25_topk | 2000 | 0.875 | 1.0 | 1994 |
+| ContextReset | 128 | hybrid_rrf | 2000 | 0.875 | 1.0 | 1994 |
+| CodeQA-style | 128 | raw_context | 2000 | 0.0 | 0.5 | 2309 |
+| CodeQA-style | 128 | query_graph | 2000 | 1.0 | 1.0 | 178 |
+| CodeQA-style | 128 | build_context | 2000 | 1.0 | 1.0 | 535 |
+| CodeQA-style | 128 | bm25_topk | 2000 | 1.0 | 1.0 | 2325 |
+| CodeQA-style | 128 | hybrid_rrf | 2000 | 1.0 | 1.0 | 2326 |
+| OOLONG-Pairs-style | 128 | raw_context | 4000 | 1.0 | 1.0 | 2517 |
+| OOLONG-Pairs-style | 128 | query_graph | 4000 | 0.0 | 0.0 | 98 |
+| OOLONG-Pairs-style | 128 | build_context | 4000 | 1.0 | 1.0 | 515 |
+| OOLONG-Pairs-style | 128 | bm25_topk | 4000 | 1.0 | 1.0 | 2517 |
+| OOLONG-Pairs-style | 128 | hybrid_rrf | 4000 | 1.0 | 1.0 | 2517 |
+| ContextReset | 128 | raw_context | 4000 | 0.875 | 1.0 | 1994 |
+| ContextReset | 128 | query_graph | 4000 | 0.0 | 0.0 | 76 |
+| ContextReset | 128 | build_context | 4000 | 0.0 | 0.0 | 121 |
+| ContextReset | 128 | bm25_topk | 4000 | 0.875 | 1.0 | 1994 |
+| ContextReset | 128 | hybrid_rrf | 4000 | 0.875 | 1.0 | 1994 |
+| CodeQA-style | 128 | raw_context | 4000 | 1.0 | 1.0 | 3262 |
+| CodeQA-style | 128 | query_graph | 4000 | 1.0 | 1.0 | 178 |
+| CodeQA-style | 128 | build_context | 4000 | 1.0 | 1.0 | 535 |
+| CodeQA-style | 128 | bm25_topk | 4000 | 1.0 | 1.0 | 3262 |
+| CodeQA-style | 128 | hybrid_rrf | 4000 | 1.0 | 1.0 | 3262 |
+
+Charts: `benchmark_results/charts/score_vs_budget.png`,
+`evidence_coverage_vs_budget.png`, `latency_vs_budget.png`,
+`tokens_returned_vs_budget.png`
 
 
 ---
 
 ## Answer-Level Evaluation
 
-_Answer-level results not yet available. Run:_
-```bash
-python benchmarks/answer_level_eval.py --families pairwise codeqa --seed 42
-```
+> **Answer-level disclaimer:** Deterministic answer-level metrics are reproducible lower bounds. They are not equivalent to human preference ratings or LLM-judge quality assessments. Scores should be interpreted as retrieval-quality proxies, not end-to-end answer quality.
+
+Pipeline: method → context pack → `DeterministicAnswerer` → final answer → scorer.
+
+| benchmark_family | scale_n | method | answerer | final_answer_exact_match | final_answer_f1 | evidence_used | hallucination_rate | tokens_injected |
+|---|---|---|---|---|---|---|---|---|
+| pairwise | 128 | rmca_full | deterministic | 0.0 | 0.30769230769230765 | 0.3333333333333333 | 0.0 | 515 |
+| pairwise | 128 | query_graph | deterministic | 0.0 | 0.125 | 0.0 | 0.0 | 98 |
+| pairwise | 128 | bm25_topk | deterministic | 0.0 | 0.125 | 0.0 | 0.0 | 1422 |
+| pairwise | 128 | raw_context | deterministic | 0.0 | 0.125 | 0.0 | 0.0 | 1422 |
+| codeqa | 128 | rmca_full | deterministic | 1.0 | 0.6 | 1.0 | 0.0 | 535 |
+| codeqa | 128 | query_graph | deterministic | 1.0 | 0.5454545454545454 | 1.0 | 0.0 | 178 |
+| codeqa | 128 | bm25_topk | deterministic | 1.0 | 0.5454545454545454 | 1.0 | 0.0 | 1398 |
+| codeqa | 128 | raw_context | deterministic | 0.0 | 0.0 | 0.5 | 0.0 | 1382 |
+| context_reset | 128 | rmca_full | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 121 |
+| context_reset | 128 | query_graph | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 76 |
+| context_reset | 128 | bm25_topk | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 1413 |
+| context_reset | 128 | raw_context | deterministic | 0.0 | 0.0 | 0.0 | 0.0 | 1413 |
 
 
 ---
@@ -387,10 +506,10 @@ python benchmarks/answer_level_eval.py --families pairwise codeqa --seed 42
 | BrowseComp-Plus-style | 128 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | BrowseComp-Plus-style | 512 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | BrowseComp-Plus-style | 2048 | 1.000 | 1.000 | raw_context | ➖ Tie |
-| CodeQA-style | 128 | 1.000 | 1.000 | query_graph | ➖ Tie |
+| CodeQA-style | 128 | 0.000 | 1.000 | query_graph | ❌ Loss |
 | CodeQA-style | 512 | 1.000 | 1.000 | query_graph | ➖ Tie |
 | CodeQA-style | 2048 | 1.000 | 1.000 | query_graph | ➖ Tie |
-| ContextReset | 10 | 0.750 | 0.875 | raw_context | ❌ Loss |
+| ContextReset | 128 | 0.000 | 0.000 | raw_context | ➖ Tie |
 | OOLONG-Pairs-style | 128 | 1.000 | 0.000 | raw_context | ✅ Win |
 | OOLONG-Pairs-style | 512 | 1.000 | 0.000 | raw_context | ✅ Win |
 | OOLONG-Pairs-style | 2048 | 1.000 | 0.000 | raw_context | ✅ Win |
@@ -400,6 +519,9 @@ python benchmarks/answer_level_eval.py --families pairwise codeqa --seed 42
 | S-NIAH-style | 128 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | S-NIAH-style | 512 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | S-NIAH-style | 2048 | 1.000 | 1.000 | raw_context | ➖ Tie |
+| codeqa | 128 | 0.000 | 0.000 | query_graph | ➖ Tie |
+| context_reset | 128 | 0.000 | 0.000 | query_graph | ➖ Tie |
+| pairwise | 128 | 0.000 | 1.000 | ablation | ❌ Loss |
 
 ---
 
@@ -419,15 +541,18 @@ RMCA wins most clearly on tasks that require traversal of typed edges (`contradi
 - **BrowseComp-Plus-style @ scale 128**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **BrowseComp-Plus-style @ scale 2048**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **BrowseComp-Plus-style @ scale 512**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
-- **CodeQA-style @ scale 128**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
+- **CodeQA-style @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 1.000 — verdict: loss
 - **CodeQA-style @ scale 2048**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
 - **CodeQA-style @ scale 512**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
-- **ContextReset @ scale 10**: RMCA scores 0.750, best baseline (raw_context) scores 0.875 — verdict: loss
+- **ContextReset @ scale 128**: RMCA scores 0.000, best baseline (raw_context) scores 0.000 — verdict: tie
 - **OOLONG-style @ scale 128**: RMCA scores 0.513, best baseline (raw_context) scores 0.885 — verdict: loss
 - **OOLONG-style @ scale 512**: RMCA scores 0.224, best baseline (raw_context) scores 0.403 — verdict: loss
 - **S-NIAH-style @ scale 128**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **S-NIAH-style @ scale 2048**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **S-NIAH-style @ scale 512**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
+- **codeqa @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 0.000 — verdict: tie
+- **context_reset @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 0.000 — verdict: tie
+- **pairwise @ scale 128**: RMCA scores 0.000, best baseline (ablation) scores 1.000 — verdict: loss
 
 ---
 

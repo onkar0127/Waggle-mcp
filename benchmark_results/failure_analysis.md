@@ -11,10 +11,10 @@
 | BrowseComp-Plus-style | 128 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | BrowseComp-Plus-style | 512 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | BrowseComp-Plus-style | 2048 | 1.000 | 1.000 | raw_context | ➖ Tie |
-| CodeQA-style | 128 | 1.000 | 1.000 | query_graph | ➖ Tie |
+| CodeQA-style | 128 | 0.000 | 1.000 | query_graph | ❌ Loss |
 | CodeQA-style | 512 | 1.000 | 1.000 | query_graph | ➖ Tie |
 | CodeQA-style | 2048 | 1.000 | 1.000 | query_graph | ➖ Tie |
-| ContextReset | 10 | 0.750 | 0.875 | raw_context | ❌ Loss |
+| ContextReset | 128 | 0.000 | 0.000 | raw_context | ➖ Tie |
 | OOLONG-Pairs-style | 128 | 1.000 | 0.000 | raw_context | ✅ Win |
 | OOLONG-Pairs-style | 512 | 1.000 | 0.000 | raw_context | ✅ Win |
 | OOLONG-Pairs-style | 2048 | 1.000 | 0.000 | raw_context | ✅ Win |
@@ -24,6 +24,9 @@
 | S-NIAH-style | 128 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | S-NIAH-style | 512 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | S-NIAH-style | 2048 | 1.000 | 1.000 | raw_context | ➖ Tie |
+| codeqa | 128 | 0.000 | 0.000 | query_graph | ➖ Tie |
+| context_reset | 128 | 0.000 | 0.000 | query_graph | ➖ Tie |
+| pairwise | 128 | 0.000 | 1.000 | ablation | ❌ Loss |
 
 ---
 
@@ -43,15 +46,18 @@ RMCA wins most clearly on tasks that require traversal of typed edges (`contradi
 - **BrowseComp-Plus-style @ scale 128**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **BrowseComp-Plus-style @ scale 2048**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **BrowseComp-Plus-style @ scale 512**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
-- **CodeQA-style @ scale 128**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
+- **CodeQA-style @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 1.000 — verdict: loss
 - **CodeQA-style @ scale 2048**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
 - **CodeQA-style @ scale 512**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
-- **ContextReset @ scale 10**: RMCA scores 0.750, best baseline (raw_context) scores 0.875 — verdict: loss
+- **ContextReset @ scale 128**: RMCA scores 0.000, best baseline (raw_context) scores 0.000 — verdict: tie
 - **OOLONG-style @ scale 128**: RMCA scores 0.513, best baseline (raw_context) scores 0.885 — verdict: loss
 - **OOLONG-style @ scale 512**: RMCA scores 0.224, best baseline (raw_context) scores 0.403 — verdict: loss
 - **S-NIAH-style @ scale 128**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **S-NIAH-style @ scale 2048**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **S-NIAH-style @ scale 512**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
+- **codeqa @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 0.000 — verdict: tie
+- **context_reset @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 0.000 — verdict: tie
+- **pairwise @ scale 128**: RMCA scores 0.000, best baseline (ablation) scores 1.000 — verdict: loss
 
 ---
 
