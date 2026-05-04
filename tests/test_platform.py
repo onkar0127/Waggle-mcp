@@ -372,7 +372,7 @@ def test_http_graph_editor_routes_and_crud(tmp_path: Path) -> None:
 
         exported_abhi = client.get("/api/graph/export", params={"format": "abhi", "project": "studio"})
         assert exported_abhi.status_code == 200
-        assert exported_abhi.content.startswith(b"PK")
+        assert exported_abhi.content.startswith(b"WGL\x01")
         assert "attachment; filename=\"waggle-memory.abhi\"" == exported_abhi.headers["content-disposition"]
         exported_abhi_b64 = base64.b64encode(exported_abhi.content).decode("ascii")
 

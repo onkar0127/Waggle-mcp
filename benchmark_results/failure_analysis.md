@@ -14,7 +14,7 @@
 | CodeQA-style | 128 | 0.000 | 1.000 | query_graph | ❌ Loss |
 | CodeQA-style | 512 | 1.000 | 1.000 | query_graph | ➖ Tie |
 | CodeQA-style | 2048 | 1.000 | 1.000 | query_graph | ➖ Tie |
-| ContextReset | 128 | 0.000 | 0.000 | raw_context | ➖ Tie |
+| ContextReset | 128 | 1.000 | 0.000 | raw_context | ✅ Win |
 | OOLONG-Pairs-style | 128 | 1.000 | 0.000 | raw_context | ✅ Win |
 | OOLONG-Pairs-style | 512 | 1.000 | 0.000 | raw_context | ✅ Win |
 | OOLONG-Pairs-style | 2048 | 1.000 | 0.000 | raw_context | ✅ Win |
@@ -26,12 +26,13 @@
 | S-NIAH-style | 2048 | 1.000 | 1.000 | raw_context | ➖ Tie |
 | codeqa | 128 | 0.000 | 0.000 | query_graph | ➖ Tie |
 | context_reset | 128 | 0.000 | 0.000 | query_graph | ➖ Tie |
-| pairwise | 128 | 0.000 | 1.000 | ablation | ❌ Loss |
+| pairwise | 128 | 0.000 | 0.000 | query_graph | ➖ Tie |
 
 ---
 
 ## Where RMCA Wins
 
+- **ContextReset @ scale 128**: RMCA scores 1.000 vs best baseline 0.000 (raw_context), delta = +1.000
 - **OOLONG-Pairs-style @ scale 128**: RMCA scores 1.000 vs best baseline 0.000 (raw_context), delta = +1.000
 - **OOLONG-Pairs-style @ scale 2048**: RMCA scores 1.000 vs best baseline 0.000 (raw_context), delta = +1.000
 - **OOLONG-Pairs-style @ scale 512**: RMCA scores 1.000 vs best baseline 0.000 (raw_context), delta = +1.000
@@ -49,7 +50,6 @@ RMCA wins most clearly on tasks that require traversal of typed edges (`contradi
 - **CodeQA-style @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 1.000 — verdict: loss
 - **CodeQA-style @ scale 2048**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
 - **CodeQA-style @ scale 512**: RMCA scores 1.000, best baseline (query_graph) scores 1.000 — verdict: tie
-- **ContextReset @ scale 128**: RMCA scores 0.000, best baseline (raw_context) scores 0.000 — verdict: tie
 - **OOLONG-style @ scale 128**: RMCA scores 0.513, best baseline (raw_context) scores 0.885 — verdict: loss
 - **OOLONG-style @ scale 512**: RMCA scores 0.224, best baseline (raw_context) scores 0.403 — verdict: loss
 - **S-NIAH-style @ scale 128**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
@@ -57,7 +57,7 @@ RMCA wins most clearly on tasks that require traversal of typed edges (`contradi
 - **S-NIAH-style @ scale 512**: RMCA scores 1.000, best baseline (raw_context) scores 1.000 — verdict: tie
 - **codeqa @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 0.000 — verdict: tie
 - **context_reset @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 0.000 — verdict: tie
-- **pairwise @ scale 128**: RMCA scores 0.000, best baseline (ablation) scores 1.000 — verdict: loss
+- **pairwise @ scale 128**: RMCA scores 0.000, best baseline (query_graph) scores 0.000 — verdict: tie
 
 ---
 
@@ -92,6 +92,23 @@ The failure analysis supports the following claims:
 3. **RMCA is competitive but not strictly better on easy retrieval tasks.** S-NIAH and CodeQA show ties with `query_graph` at current scales. The differentiation would likely appear at larger scales (8K+ nodes) where raw context dumps hit the budget wall.
 
 4. **The ContextReset benchmark is the most novel evaluation.** It directly tests the session-boundary use case that motivates Waggle's design. RMCA's `active_decision_preference` scoring (preferring the latest active decision over the superseded one) is a capability that flat retrieval baselines cannot replicate without explicit edge traversal.
+
+---
+
+> **Synthetic data caveat:** The current RMCA evaluation uses deterministic synthetic Waggle memory tasks mapped to Waggle's graph/transcript environment. Numerical results **must not be compared** to results from the RLM paper (Zhang et al., 2026) or other long-context benchmarks until the exact public datasets (RULER S-NIAH, BrowseComp-Plus, OOLONG, OOLONG-Pairs, LongBench-v2 CodeQA) are downloaded and run with a matching model setup.
+
+## Ablation Interpretation
+
+On the current synthetic pairwise benchmark, decomposition is the primary
+load-bearing RMCA component. Disabling decomposition (`rmca_no_decomposition`)
+or replacing it with random subqueries (`rmca_random_subqueries`) reduces
+pairwise score from 1.0 to 0.0. Disabling graph expansion
+(`rmca_no_graph_expansion`) or explicit conflict resolution
+(`rmca_no_conflict_resolution`) does not reduce score at scale 128, indicating
+that direct retrieval already surfaces the conflict nodes in this setup.
+
+Future pairwise variants should be constructed to isolate graph traversal
+benefits. See `pairwise_hidden_edge` benchmark family for this purpose.
 
 ---
 
