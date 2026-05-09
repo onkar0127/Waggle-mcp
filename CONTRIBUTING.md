@@ -1,19 +1,186 @@
-# Contributing
+# Contributing to Waggle-MCP
 
-Thanks for your interest in improving Waggle.
+Thank you for your interest in improving Waggle. This document covers everything you need to get started: environment setup, project architecture, testing, code style, and PR guidelines.
 
-## How to contribute
+---
 
-- Open an issue for bugs, docs gaps, benchmark methodology concerns, or feature proposals.
-- Open a pull request with a focused change and a clear description of impact.
-- For benchmark-claim changes in `README.md`, include updated artifact links under `tests/artifacts/`.
+## Table of Contents
 
-## Local validation
+- [Getting Started](#getting-started)
+- [Project Architecture](#project-architecture)
+- [Running Tests](#running-tests)
+- [Code Style](#code-style)
+- [Key Concepts](#key-concepts)
+- [How to Submit a PR](#how-to-submit-a-pr)
+
+---
+
+## Getting Started
 
 ```bash
-source .venv/bin/activate
+# 1. Clone and enter the repo
+git clone https://github.com/Abhigyan-Shekhar/Waggle-mcp.git
+cd Waggle-mcp
+
+# 2. Create a virtual environment (Python 3.11+ required)
+python -m venv .venv
+source .venv/bin/activate     # macOS/Linux
+# .venv\Scripts\activate      # Windows
+
+# 3. Install project + all dev tools (ruff, mypy, pytest)
 pip install -e ".[dev]"
-pytest -q
+
+# 4. Verify the setup
+waggle-mcp --help
 ```
 
-If your PR changes benchmark-facing numbers, regenerate the corresponding artifacts and update `tests/artifacts/README.md`.
+---
+
+## Project Architecture
+
+```
+src/waggle/
+├── server.py           — MCP server, CLI entrypoint, all tool definitions
+├── graph.py            — Core SQLite-backed graph engine (MemoryGraph)
+├── neo4j_graph.py      — Neo4j backend (mirrors graph.py API)
+├── models.py           — Pydantic data models (Node, Edge, etc.)
+├── config.py           — Environment-driven AppConfig (WAGGLE_* env vars)
+├── embeddings.py       — EmbeddingModel: sentence-transformers + deterministic fallback
+├── intelligence.py     — NLP heuristics: node extraction, conflict detection, labelling
+├── recursive_context.py — build_context / RecursiveContextController
+├── abhi.py             — .abhi portable memory format (export, import, diff, merge)
+├── retrieval/
+│   └── hybrid.py       — Hybrid retrieval: vector + BM25 + graph fusion
+├── hooks/
+│   └── claude_code/    — Pre/post-response hook scripts for Claude Code
+└── static/             — Bundled Graph Studio web UI assets
+```
+
+### Key Data Flow
+
+```
+observe_conversation()
+    └─► intelligence.extract_conversation_candidates()
+    └─► MemoryGraph.store_node() × N           ← SQLite write + embedding
+    └─► MemoryGraph.store_edge()  × M           ← auto-inferred edges
+
+query_graph() / build_context()
+    └─► EmbeddingModel.embed(query)
+    └─► HybridRetriever.retrieve()             ← vector + BM25 + graph
+    └─► MemoryGraph._expand_node_depths()      ← graph traversal
+    └─► RecursiveContextController.assemble()  ← token-budgeted pack
+```
+
+### Scoping / Tenancy
+
+Every node and transcript record carries three scope fields:
+
+| Field | Purpose | Example |
+|---|---|---|
+| `tenant_id` | Top-level multi-tenant isolation | `"local-default"` |
+| `project` | Per-project scoping within a tenant | `"waggle-mcp"` |
+| `agent_id` | Per-agent/client identifier | `"cursor"` |
+| `session_id` | Per-conversation identifier | `"thread-abc123"` |
+
+Always pass a stable `project` value for the same codebase across sessions — fragmenting scope by accident is the most common source of poor recall.
+
+---
+
+## Running Tests
+
+```bash
+# Fast: deterministic embeddings — no 420 MB download, no network
+WAGGLE_MODEL=deterministic pytest -q
+
+# With sentence-transformers (requires model download on first run)
+pytest -q
+
+# Single file
+WAGGLE_MODEL=deterministic pytest tests/test_graph.py -q
+
+# Verbose with failure detail
+WAGGLE_MODEL=deterministic pytest -v --tb=short
+```
+
+> **Always use `WAGGLE_MODEL=deterministic` in CI and local development** unless you are specifically testing embedding quality. The deterministic fallback uses SHA-256 hashing and is fast, reproducible, and requires no network.
+
+If you change benchmark-facing numbers, regenerate the corresponding artifacts and update `tests/artifacts/README.md`.
+
+---
+
+## Code Style
+
+This project uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting.
+
+```bash
+# Check for issues
+ruff check src/ tests/
+
+# Auto-fix safe issues
+ruff check --fix src/ tests/
+
+# Format code
+ruff format src/ tests/
+
+# Type checking (permissive — incremental tightening in progress)
+mypy src/waggle/
+```
+
+Rules are configured in `pyproject.toml` under `[tool.ruff]`. Notable decisions:
+
+- **Line length:** 120 (source files are dense; 88 is too aggressive here)
+- **Import style:** `isort`-compatible, first-party packages `waggle` and `rlm`
+- **Ignored:** `E501` (handled by formatter), `B008` (Pydantic defaults), `RUF012`
+
+---
+
+## Key Concepts
+
+### Node Types
+`fact`, `entity`, `concept`, `preference`, `decision`, `question`, `note`
+
+### Edge Types
+`relates_to`, `contradicts`, `depends_on`, `part_of`, `updates`, `derived_from`, `similar_to`
+
+### Temporal Validity
+Every node has optional `valid_from` / `valid_to` fields. `query_graph` excludes expired nodes by default. Use `include_invalidated=True` or `as_of=<ISO-8601>` to query historical state.
+
+### The `.abhi` Format
+Portable memory snapshots. JSON underneath with optional AES-256-GCM encryption, a content hash, and a magic-bytes header (`WGL\x01`). Use `waggle-mcp fsck <file.abhi>` to validate without importing.
+
+### WAGGLE_MODEL=deterministic
+The offline-safe embedding mode. Uses SHA-256 hashing to produce a 256-dim float32 vector. Slightly lower retrieval quality than sentence-transformers but instant startup and zero network dependency. **Use this in tests.**
+
+---
+
+## How to Submit a PR
+
+1. **Open an issue first** for bugs, doc gaps, or feature proposals — especially larger changes.
+2. **Fork and branch** from `main`. Use a descriptive branch name like `fix/dockerfile-version` or `feat/dry-run-import`.
+3. **Keep PRs focused.** One logical change per PR makes review faster.
+4. **Write a clear description.** Explain *what* changed and *why*, not just *how*.
+5. **Run tests before pushing:**
+   ```bash
+   WAGGLE_MODEL=deterministic pytest -q
+   ruff check src/ tests/
+   ```
+6. **Benchmark changes:** If your PR affects retrieval quality or token efficiency, include updated artifact links under `tests/artifacts/`.
+7. **Open the PR** — CI will run automatically and the maintainer will review.
+
+### Commit Message Style
+
+```
+<type>(<scope>): <short description>
+
+<optional body explaining why>
+```
+
+Types: `fix`, `feat`, `docs`, `test`, `refactor`, `ci`, `chore`
+
+Examples:
+```
+fix(docker): sync image version label with pyproject.toml
+feat(cli): add --dry-run flag to import and pull commands
+ci: add test workflow for Python 3.11-3.13
+docs: expand CONTRIBUTING with architecture overview
+```

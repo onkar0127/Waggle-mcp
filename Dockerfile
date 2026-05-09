@@ -29,9 +29,13 @@ RUN pip install --upgrade pip && \
 # ──────────────────────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
+# VERSION is injected at build time; defaults to the current release.
+# To override: docker build --build-arg VERSION=0.1.14 .
+ARG VERSION=0.1.14
+
 LABEL org.opencontainers.image.title="waggle-mcp" \
       org.opencontainers.image.description="MCP server that gives LLMs persistent graph-structured memory" \
-      org.opencontainers.image.version="0.1.11" \
+      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.authors="Abhigyan Shekhar" \
       org.opencontainers.image.url="https://github.com/Abhigyan-Shekhar/Waggle-mcp" \
       org.opencontainers.image.source="https://github.com/Abhigyan-Shekhar/Waggle-mcp" \

@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   waggle:
     image: ghcr.io/abhigyan-shekhar/waggle-mcp:latest
