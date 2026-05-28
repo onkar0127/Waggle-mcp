@@ -244,6 +244,7 @@ def test_doctor_flags_mixed_embedding_model_ids(
 ) -> None:
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     write_waggle_codex_config(tmp_path, db_path)
     graph = MemoryGraph(db_path, FakeEmbeddingModel())
     graph.observe_conversation(
@@ -296,6 +297,7 @@ def test_doctor_fix_reembeds_mixed_embedding_model_ids(
 ) -> None:
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     write_waggle_codex_config(tmp_path, db_path)
     graph = MemoryGraph(db_path, FakeEmbeddingModel())
     graph.observe_conversation(
