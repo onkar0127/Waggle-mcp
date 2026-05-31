@@ -475,9 +475,7 @@ def test_regression_graph_neighborhood_includes_connected_nodes(tmp_path: Path) 
     )
     graph_expansion_layer = debug["layers"].get("graph_expansion", [])
     vector_node_ids = {
-        entry["node_ids"][0]
-        for entry in debug["layers"].get("vector_node", [])
-        if entry.get("node_ids")
+        entry["node_ids"][0] for entry in debug["layers"].get("vector_node", []) if entry.get("node_ids")
     }
     assert graph_expansion_layer, "Graph expansion layer should return results."
     assert node_a.id in vector_node_ids, (
