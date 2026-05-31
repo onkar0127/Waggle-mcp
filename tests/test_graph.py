@@ -381,7 +381,7 @@ def test_node_cosine_similarity_logs_and_reraises_errors(tmp_path, caplog):
     caplog.at_level(logging.WARNING),
     pytest.raises(RuntimeError, match="embedding decode failed"),
 ):
-    graph._node_cosine_similarity(node_a, node_b)
+        graph._node_cosine_similarity(node_a, node_b)
 
     assert any(
         "Failed to compute cosine similarity" in record.message
