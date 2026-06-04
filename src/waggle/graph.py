@@ -3881,7 +3881,7 @@ class MemoryGraph:
         project: str,
         session_id: str,
     ) -> list[ReplayHit]:
-        with self._lock, self._pool.checkout() as connection:
+        with self._lock.read(), self._pool.checkout() as connection:
             filters = ["tenant_id = ?", "embedding IS NOT NULL"]
             params: list[Any] = [self.tenant_id]
             if project.strip():
@@ -3968,7 +3968,7 @@ class MemoryGraph:
         project: str,
         session_id: str,
     ) -> dict[str, float]:
-        with self._lock, self._pool.checkout() as connection:
+        with self._lock.read(), self._pool.checkout() as connection:
             filters = ["tenant_id = ?", "embedding IS NOT NULL"]
             params: list[Any] = [self.tenant_id]
             if project.strip():
@@ -4023,7 +4023,7 @@ class MemoryGraph:
         project: str,
         session_id: str,
     ) -> dict[str, float]:
-        with self._lock, self._pool.checkout() as connection:
+        with self._lock.read(), self._pool.checkout() as connection:
             rows = connection.execute(
                 """
                 SELECT id, tenant_id, agent_id, project, session_id, observed_at, turn_index, role, transcript_text, metadata
@@ -4405,7 +4405,7 @@ class MemoryGraph:
         normalized_session = session_id.strip()
         if not normalized_session:
             raise ValueError("session_id is required.")
-        with self._lock, self._connect() as connection:
+        with self._lock, self._pool.checkout() as connection:
             result = self._clear_scope_rows(connection, scope="session", session_id=normalized_session, dry_run=dry_run)
             if not dry_run:
                 self.emit_audit_event(
@@ -4422,7 +4422,7 @@ class MemoryGraph:
         normalized_project = project.strip()
         if not normalized_project:
             raise ValueError("project is required.")
-        with self._lock, self._connect() as connection:
+        with self._lock, self._pool.checkout() as connection:
             result = self._clear_scope_rows(connection, scope="project", project=normalized_project, dry_run=dry_run)
             if not dry_run:
                 self.emit_audit_event(
@@ -4436,7 +4436,7 @@ class MemoryGraph:
             return result
 
     def clear_all(self, *, dry_run: bool = False) -> ClearScopeResult:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._pool.checkout() as connection:
             result = self._clear_scope_rows(connection, scope="all", dry_run=dry_run)
             if not dry_run:
                 self.emit_audit_event(
