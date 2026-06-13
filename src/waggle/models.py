@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -146,6 +147,9 @@ class EvidenceRecord(BaseModel):
         if value is None:
             return ""
         return str(value).strip()
+
+
+Node.model_rebuild()
 
 
 class Edge(BaseModel):
@@ -885,6 +889,8 @@ class ClearScopeResult(BaseModel):
     deleted_context_window_edges: int = 0
     deleted_repos: int = 0
     deleted_graph_ui_rows: int = 0
+    dry_run: bool = False
+    counts_by_node_type: dict[str, int] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -991,3 +997,11 @@ class MergeStrategyConfig(BaseModel):
         except Exception:
             pass
         return cls()
+
+
+@dataclass(slots=True)
+class ScoredNodeView:
+    node_id: str
+    updated_at_ts: float
+    final_score: float
+    label_lower: str
