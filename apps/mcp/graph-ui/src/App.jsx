@@ -588,7 +588,15 @@ export function App() {
   };
 
   const mergeNode = async (sourceId) => {
-    if (!selectedNodeId || selectedNodeId === sourceId || boot.sampleMode || readOnly) {
+    if (readOnly) {
+      setToast("Cannot modify graph in view mode.");
+      return;
+    }
+    if (boot.sampleMode) {
+      setToast("Cannot modify sample data.");
+      return;
+    }
+    if (!selectedNodeId || selectedNodeId === sourceId) {
       setToast("Select a destination graph node first.");
       return;
     }
