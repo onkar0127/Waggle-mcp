@@ -5366,12 +5366,16 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
                 "node_model_counts": node_models,
                 "transcript_stale_rows": store_health["transcript_stale_rows"],
                 "node_stale_rows": store_health["node_stale_rows"],
+                "window_stale_rows": store_health["window_stale_rows"],
                 "mixed_models": store_health["mixed_models"],
                 "checksum_failures": checksum_failures,
                 "transcript_checksum_failures": store_health["transcript_checksum_failures"],
                 "node_checksum_failures": store_health["node_checksum_failures"],
                 "window_checksum_failures": store_health["window_checksum_failures"],
                 "legacy_rows": legacy_rows,
+                "transcript_legacy_rows": store_health["transcript_legacy_rows"],
+                "node_legacy_rows": store_health["node_legacy_rows"],
+                "window_legacy_rows": store_health["window_legacy_rows"],
             }
     except Exception as exc:
         message = f"Embedding store check failed: {type(exc).__name__}: {exc}"

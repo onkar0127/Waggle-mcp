@@ -380,3 +380,67 @@ def test_multi_intent_query_survives_corrupt_embedding(tmp_path: Path):
         retrieval_mode="graph",
     )
     assert result is not None
+
+
+# ── decode hardening: corrupted magic, misaligned payload, deserialization (review 3) ─
+
+
+def _corrupt_node_magic(graph: MemoryGraph, node_id: str) -> None:
+    blob = bytearray(_node_embedding_blob(graph, node_id))
+    # Flip a byte *inside* the 4-byte magic prefix. is_checksummed_embedding() now
+    # returns False, but the inner raw+CRC is intact — decode must treat this as
+    # corruption, not silently pass the whole blob through as "legacy".
+    blob[0] ^= 0xFF
+    _write_node_embedding(graph, node_id, bytes(blob))
+
+
+def test_decode_rejects_corrupted_magic():
+    raw = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32).tobytes()
+    blob = bytearray(encode_embedding_blob(raw))
+    blob[0] ^= 0xFF  # damage the magic, leave raw+CRC intact
+    assert decode_embedding_blob(bytes(blob)) is None
+
+
+def test_decode_rejects_misaligned_canonical_payload():
+    # CRC is valid, but a 3-byte payload is not a whole number of float32 values.
+    assert decode_embedding_blob(encode_embedding_blob(b"abc")) is None
+
+
+def test_decode_falls_back_when_model_deserialization_raises(tmp_path: Path):
+    class RaisingModel(FakeEmbeddingModel):
+        def from_bytes(self, data: bytes) -> np.ndarray:
+            raise ValueError("cannot deserialize")
+
+    graph = MemoryGraph(tmp_path / "memory.db", RaisingModel())
+    raw = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32).tobytes()
+    # decode_embedding_blob accepts it (valid CRC, 4-aligned); the model raises, so
+    # _decode_embedding must still return None rather than propagating.
+    assert graph._decode_embedding(encode_embedding_blob(raw)) is None
+
+
+def test_corrupt_magic_is_a_failure_and_is_cleared(tmp_path: Path):
+    graph = make_graph(tmp_path)
+    node = graph.add_node(label="A", content="alpha beta", node_type=NodeType.ENTITY).node
+    _corrupt_node_magic(graph, node.id)
+
+    health = graph.get_embedding_store_health()
+    # Counted as a failure (real corruption), NOT as a benign legacy row.
+    assert health["node_checksum_failures"] == 1
+    assert health["node_legacy_rows"] == 0
+
+    assert graph.clear_corrupt_embeddings()["nodes"] == 1
+    repaired = graph.reembed_stale_embeddings(batch_size=10)
+    assert repaired["node_rows_updated"] == 1
+    assert graph.get_embedding_store_health()["node_checksum_failures"] == 0
+
+
+def test_migration_does_not_launder_corrupt_magic(tmp_path: Path):
+    graph = make_graph(tmp_path)
+    node = graph.add_node(label="A", content="alpha beta", node_type=NodeType.ENTITY).node
+    _corrupt_node_magic(graph, node.id)
+
+    # The on-open migration (and the explicit call) must NOT wrap a corrupt blob
+    # into a valid-looking checksummed one — decode must still reject it.
+    graph.migrate_embeddings_to_checksummed()
+    assert decode_embedding_blob(_node_embedding_blob(graph, node.id)) is None
+    assert graph.get_embedding_store_health()["node_checksum_failures"] == 1

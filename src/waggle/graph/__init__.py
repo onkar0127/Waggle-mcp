@@ -1721,11 +1721,12 @@ class MemoryGraph(TranscriptMixin, TraversalMixin, MutationMixin, MemoryGraphBas
     def _scan_embedding_integrity(connection: sqlite3.Connection, table: str, tenant_id: str) -> dict[str, int]:
         """Count checksum failures and un-checksummed (legacy) embedding rows for one tenant.
 
-        A "failure" is a blob in the canonical checksummed form whose CRC does not
-        validate — i.e. detected bit-rot. A "legacy" row is a pre-checksum blob that
-        carries no trailer yet (counted for migration visibility, never a failure).
-        Scoped to ``tenant_id`` so multi-tenant databases do not leak other tenants'
-        rows into a tenant-local health report.
+        A "failure" is detected corruption: a canonical blob whose CRC does not
+        validate, or a blob with damaged magic that still carries a valid inner
+        checksum (i.e. ``decode_embedding_blob`` rejects it). A "legacy" row is a
+        genuine pre-checksum blob that decodes verbatim — never a failure. Scoped
+        to ``tenant_id`` so multi-tenant databases do not leak other tenants' rows
+        into a tenant-local health report.
         """
         failures = 0
         legacy = 0
@@ -1736,9 +1737,14 @@ class MemoryGraph(TranscriptMixin, TraversalMixin, MutationMixin, MemoryGraphBas
             if not isinstance(blob, (bytes, bytearray)):
                 continue
             blob = bytes(blob)
+            decoded = decode_embedding_blob(blob)
             if is_checksummed_embedding(blob):
-                if decode_embedding_blob(blob) is None:
+                if decoded is None:
                     failures += 1
+            elif decoded is None:
+                # Not checksummed by prefix, but decode rejects it: corruption
+                # inside the magic bytes, not a clean legacy blob.
+                failures += 1
             else:
                 legacy += 1
         return {"failures": failures, "legacy": legacy}
@@ -1768,11 +1774,20 @@ class MemoryGraph(TranscriptMixin, TraversalMixin, MutationMixin, MemoryGraphBas
             ).fetchall()
             for row in rows:
                 blob = row["embedding"]
-                if not isinstance(blob, (bytes, bytearray)) or is_checksummed_embedding(bytes(blob)):
+                if not isinstance(blob, (bytes, bytearray)):
                     continue
+                blob = bytes(blob)
+                if is_checksummed_embedding(blob) or decode_embedding_blob(blob) is None:
+                    # Already canonical, or corrupt (e.g. damaged magic with an
+                    # otherwise-valid trailer): never wrap a corrupt blob into a
+                    # valid-looking checksummed one — clear/doctor repairs those.
+                    continue
+                # Guard on the exact blob observed during the scan: if another
+                # process rewrote this row between fetch and update, the WHERE
+                # fails to match and we neither clobber the new value nor count it.
                 cursor = connection.execute(
-                    f"UPDATE {table} SET embedding = ? WHERE tenant_id = ? AND id = ?",
-                    (encode_embedding_blob(bytes(blob)), self.tenant_id, row["id"]),
+                    f"UPDATE {table} SET embedding = ? WHERE tenant_id = ? AND id = ? AND embedding = ?",
+                    (encode_embedding_blob(blob), self.tenant_id, row["id"], blob),
                 )
                 if cursor.rowcount and cursor.rowcount > 0:
                     upgraded[table] += 1
@@ -1799,13 +1814,17 @@ class MemoryGraph(TranscriptMixin, TraversalMixin, MutationMixin, MemoryGraphBas
                     if not isinstance(blob, (bytes, bytearray)):
                         continue
                     blob = bytes(blob)
-                    if is_checksummed_embedding(blob) and decode_embedding_blob(blob) is None:
-                        connection.execute(
+                    # Corruption is "decode rejects a non-empty blob": a canonical
+                    # blob with a bad CRC, or one with damaged magic. A genuine
+                    # legacy blob decodes verbatim (non-None) and is left untouched.
+                    if decode_embedding_blob(blob) is None:
+                        cursor = connection.execute(
                             f"UPDATE {table} SET embedding = NULL, embedding_model_id = '', embedding_dim = 0 "
-                            "WHERE tenant_id = ? AND id = ?",
-                            (self.tenant_id, row["id"]),
+                            "WHERE tenant_id = ? AND id = ? AND embedding = ?",
+                            (self.tenant_id, row["id"], blob),
                         )
-                        cleared[table] += 1
+                        if cursor.rowcount and cursor.rowcount > 0:
+                            cleared[table] += 1
             window_rows = connection.execute(
                 "SELECT id, embedding FROM context_windows WHERE tenant_id = ? AND embedding IS NOT NULL",
                 (self.tenant_id,),
@@ -1815,13 +1834,14 @@ class MemoryGraph(TranscriptMixin, TraversalMixin, MutationMixin, MemoryGraphBas
                 if not isinstance(blob, (bytes, bytearray)):
                     continue
                 blob = bytes(blob)
-                if is_checksummed_embedding(blob) and decode_embedding_blob(blob) is None:
-                    connection.execute(
+                if decode_embedding_blob(blob) is None:
+                    cursor = connection.execute(
                         "UPDATE context_windows SET embedding = NULL, embedding_stale = 1, updated_at = ? "
-                        "WHERE tenant_id = ? AND id = ?",
-                        (utc_now().isoformat(), self.tenant_id, row["id"]),
+                        "WHERE tenant_id = ? AND id = ? AND embedding = ?",
+                        (utc_now().isoformat(), self.tenant_id, row["id"], blob),
                     )
-                    cleared["context_windows"] += 1
+                    if cursor.rowcount and cursor.rowcount > 0:
+                        cleared["context_windows"] += 1
         return cleared
 
     def recompute_stale_window_embeddings(self) -> int:

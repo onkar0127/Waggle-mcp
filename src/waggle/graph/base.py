@@ -92,7 +92,12 @@ class MemoryGraphBase:
         raw = decode_embedding_blob(blob)
         if raw is None:
             return None
-        return self.embedding_model.from_bytes(raw)
+        try:
+            return self.embedding_model.from_bytes(raw)
+        except (TypeError, ValueError):
+            # A CRC-valid payload can still fail model deserialization (e.g. a
+            # dimension the current model can't interpret); treat as no embedding.
+            return None
 
 
 def _parse_datetime(raw: str) -> datetime:
@@ -149,6 +154,7 @@ def _normalized_content_hash(text: str) -> str:
 # hardware CRC32C later is a one-function change.
 EMBEDDING_BLOB_MAGIC = b"WEB1"
 _EMBEDDING_CRC_LEN = 4
+_EMBEDDING_ITEM_SIZE = 4  # float32 element width, in bytes
 
 
 def encode_embedding_blob(raw: bytes) -> bytes:
@@ -171,27 +177,51 @@ def ensure_encoded_embedding(blob: bytes) -> bytes:
     return blob if is_checksummed_embedding(blob) else encode_embedding_blob(blob)
 
 
+def _verified_canonical_raw(body: bytes) -> bytes | None:
+    """Validate a checksummed *body* (raw float32 bytes + CRC trailer).
+
+    Returns the raw bytes when the trailer matches and the payload is a non-empty
+    whole number of float32 values; ``None`` otherwise. A matching CRC alone does
+    not prove a usable vector — an empty or non-4-aligned payload would still break
+    ``np.frombuffer`` downstream — so those are rejected here as well.
+    """
+    if len(body) < _EMBEDDING_CRC_LEN:
+        return None
+    raw, trailer = body[:-_EMBEDDING_CRC_LEN], body[-_EMBEDDING_CRC_LEN:]
+    if not raw or len(raw) % _EMBEDDING_ITEM_SIZE:
+        return None
+    expected = struct.pack("<I", zlib.crc32(raw) & 0xFFFFFFFF)
+    if trailer != expected:
+        return None
+    return raw
+
+
 def decode_embedding_blob(blob: bytes | None) -> bytes | None:
     """Return verified raw float32 bytes, or ``None`` if absent or corrupt.
 
     * ``None``/empty input → ``None`` (no embedding).
-    * Checksummed blob whose CRC matches → the raw float32 bytes.
-    * Checksummed blob whose CRC fails → ``None`` (corruption; caller treats the
-      row as having no usable embedding and may re-embed it).
+    * Checksummed blob whose CRC matches a non-empty, 4-aligned payload → the raw
+      float32 bytes.
+    * Checksummed blob whose CRC fails (or whose payload is empty / not a whole
+      number of float32 values) → ``None`` (corruption; caller treats the row as
+      having no usable embedding and may re-embed it).
+    * Corrupted-magic blob: a flip inside the 4-byte magic would make the prefix
+      check fail and otherwise leak the whole canonical blob through as "legacy".
+      If the bytes after a 4-byte prefix still carry a valid checksum trailer, the
+      blob was checksummed with damaged magic → treated as corrupt (``None``), not
+      legacy.
     * Legacy blob with no magic prefix → returned verbatim (no checksum exists
       yet to validate; upgraded on the next write or by the migration).
     """
     if not blob:
         return None
     if is_checksummed_embedding(blob):
-        body = blob[len(EMBEDDING_BLOB_MAGIC) :]
-        if len(body) < _EMBEDDING_CRC_LEN:
-            return None
-        raw, trailer = body[:-_EMBEDDING_CRC_LEN], body[-_EMBEDDING_CRC_LEN:]
-        expected = struct.pack("<I", zlib.crc32(raw) & 0xFFFFFFFF)
-        if trailer != expected:
-            return None
-        return raw
+        return _verified_canonical_raw(blob[len(EMBEDDING_BLOB_MAGIC) :])
+    if (
+        len(blob) >= len(EMBEDDING_BLOB_MAGIC) + _EMBEDDING_CRC_LEN
+        and _verified_canonical_raw(blob[len(EMBEDDING_BLOB_MAGIC) :]) is not None
+    ):
+        return None
     return blob
 
 
