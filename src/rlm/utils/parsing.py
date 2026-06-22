@@ -95,6 +95,7 @@ def format_iteration(iteration: RLMIteration, max_character_length: int = 20000)
         messages.append(execution_message)
     return messages
 
+
 # REPL formatting helpers
 def format_execution_result(result: REPLResult) -> str:
     """
