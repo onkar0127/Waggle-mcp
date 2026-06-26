@@ -29,10 +29,12 @@ from mcp.server.lowlevel.server import request_ctx
 from mcp.server.models import InitializationOptions
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from waggle import __version__
 from waggle.abhi import (
@@ -91,6 +93,8 @@ from waggle.recursive_context import (
     RecursiveContextController,
 )
 from waggle.runtime_context import runtime_context
+from waggle.runtime_info import SERVER_NAME, WAGGLE_SERVER_INFO
+from waggle.secure_temp import secure_temp_path, write_secure_temp
 from waggle.serializer import (
     serialize_abhi_chunk_load,
     serialize_abhi_inspect,
@@ -137,6 +141,9 @@ WRITE_HEAVY_TOOLS = {
     "store_edge",
     "decompose_and_store",
     "observe_conversation",
+    "clear_session",
+    "clear_project",
+    "clear_all",
     # git-vocabulary names (canonical)
     "pull",
     "merge",
@@ -478,7 +485,10 @@ def _assert_runtime_feature_parity() -> None:
 
 
 def _build_backend(config: AppConfig) -> Any:
-    embedding_model = EmbeddingModel(config.model_name)
+    embedding_model = EmbeddingModel(
+        config.model_name,
+        embedding_backend=config.embedding_backend,
+    )
     # Disable ML entirely in fast/inspection mode.
     if config.is_fast_mode:
         embedding_model.disable_warmup()
@@ -1032,6 +1042,11 @@ class WaggleServer:
                             "default": False,
                             "description": "Must be true to perform the destructive clear operation.",
                         },
+                        "dry_run": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Preview the clear operation without deleting data.",
+                        },
                     },
                     required=["session_id"],
                 ),
@@ -1050,6 +1065,11 @@ class WaggleServer:
                             "default": False,
                             "description": "Must be true to perform the destructive clear operation.",
                         },
+                        "dry_run": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Preview the clear operation without deleting data.",
+                        },
                     },
                     required=["project"],
                 ),
@@ -1066,6 +1086,11 @@ class WaggleServer:
                             "type": "boolean",
                             "default": False,
                             "description": "Must be true to perform the destructive clear operation.",
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Preview the clear operation without deleting data.",
                         },
                     }
                 ),
@@ -1554,6 +1579,12 @@ class WaggleServer:
         graph = self.current_graph()
         started = time.perf_counter()
         graph.ensure_tenant(graph.tenant_id)
+        if self.config.api_key_environment == "live" and self.config.default_tenant_id == "local-default":
+            LOGGER.warning(
+                "WAGGLE_API_KEY_ENVIRONMENT is set to 'live' but "
+                "WAGGLE_DEFAULT_TENANT_ID is still 'local-default'. "
+                "Production deployments should use a unique tenant ID."
+            )
         em = graph.embedding_model
         if self.config.is_fast_mode:
             # Fast mode: zero ML overhead. Schema inspection is the goal.
@@ -1644,10 +1675,11 @@ class WaggleServer:
 
     def initialization_options(self) -> InitializationOptions:
         return InitializationOptions(
-            server_name="waggle",
-            server_version="0.2.0",
+            server_name=SERVER_NAME,
+            server_version=__version__,
             capabilities=self.server.get_capabilities(
-                notification_options=NotificationOptions(), experimental_capabilities={}
+                notification_options=NotificationOptions(),
+                experimental_capabilities={"waggle_server_info": WAGGLE_SERVER_INFO},
             ),
         )
 
@@ -1979,26 +2011,38 @@ class WaggleServer:
                         {"id": node.id, "label": node.label, "tenant_id": node.tenant_id},
                     )
                 elif name == "clear_session":
-                    self._require_clear_confirmation(arguments, "clear_session")
-                    cleared = graph.clear_session(session_id=arguments["session_id"])
+                    dry_run = bool(arguments.get("dry_run", False))
+                    if not dry_run:
+                        self._require_clear_confirmation(arguments, "clear_session")
+                    cleared = graph.clear_session(session_id=arguments["session_id"], dry_run=dry_run)
+                    prefix = "[Preview] Would clear" if dry_run else "Cleared"
+                    verb = "Would delete" if dry_run else "Deleted"
                     result = self._tool_result(
-                        f"Cleared session '{cleared.session_id}'. Deleted {cleared.deleted_nodes} node(s), "
+                        f"{prefix} session '{cleared.session_id}'. {verb} {cleared.deleted_nodes} node(s), "
                         f"{cleared.deleted_edges} edge(s), and {cleared.deleted_transcripts} transcript record(s).",
                         self._clear_scope_payload(cleared),
                     )
                 elif name == "clear_project":
-                    self._require_clear_confirmation(arguments, "clear_project")
-                    cleared = graph.clear_project(project=arguments["project"])
+                    dry_run = bool(arguments.get("dry_run", False))
+                    if not dry_run:
+                        self._require_clear_confirmation(arguments, "clear_project")
+                    cleared = graph.clear_project(project=arguments["project"], dry_run=dry_run)
+                    prefix = "[Preview] Would clear" if dry_run else "Cleared"
+                    verb = "Would delete" if dry_run else "Deleted"
                     result = self._tool_result(
-                        f"Cleared project '{cleared.project}'. Deleted {cleared.deleted_nodes} node(s), "
+                        f"{prefix} project '{cleared.project}'. {verb} {cleared.deleted_nodes} node(s), "
                         f"{cleared.deleted_edges} edge(s), and {cleared.deleted_transcripts} transcript record(s).",
                         self._clear_scope_payload(cleared),
                     )
                 elif name == "clear_all":
-                    self._require_clear_confirmation(arguments, "clear_all")
-                    cleared = graph.clear_all()
+                    dry_run = bool(arguments.get("dry_run", False))
+                    if not dry_run:
+                        self._require_clear_confirmation(arguments, "clear_all")
+                    cleared = graph.clear_all(dry_run=dry_run)
+                    prefix = "[Preview] Would clear" if dry_run else "Cleared"
+                    verb = "Would delete" if dry_run else "Deleted"
                     result = self._tool_result(
-                        f"Cleared all graph memory data for tenant '{graph.tenant_id}'. Deleted {cleared.deleted_nodes} node(s), "
+                        f"{prefix} all graph memory data for tenant '{graph.tenant_id}'. {verb} {cleared.deleted_nodes} node(s), "
                         f"{cleared.deleted_edges} edge(s), and {cleared.deleted_transcripts} transcript record(s).",
                         self._clear_scope_payload(cleared),
                     )
@@ -2911,6 +2955,34 @@ class MCPHttpApp:
         return receive
 
 
+class _RequestBodySizeMiddleware:
+    """Reject requests whose Content-Length exceeds max_payload_bytes."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        content_length = headers.get("content-length")
+        if content_length is not None:
+            try:
+                length = int(content_length)
+            except (ValueError, TypeError):
+                length = 0
+            if length > self.max_bytes:
+                response = Response(
+                    f"Request body exceeds maximum allowed size of {self.max_bytes} bytes.",
+                    status_code=413,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def create_http_application(app_server: WaggleServer, config: AppConfig) -> Starlette:
     service = MCPHttpApp(app_server, config)
 
@@ -3114,6 +3186,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
     async def graph_transcripts(request: Request) -> Response:
         scope = _scope_from_request(request)
         limit = int(request.query_params.get("limit", "200") or "200")
+        offset = int(request.query_params.get("offset", "0") or "0")
         query_text = request.query_params.get("query", "").strip()
         graph, _ = _require_http_scope(request, "graph:read")
         if query_text and hasattr(graph, "search_transcript_records"):
@@ -3134,18 +3207,24 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
             )
         if not hasattr(graph, "list_transcript_records"):
             raise ValidationFailure("Transcript listing is not available in this backend.")
-        records = graph.list_transcript_records(limit=limit, **scope)
+        records = graph.list_transcript_records(limit=limit, offset=offset, **scope)
+        total_count = graph.count_transcript_records(**scope)
         _emit_http_audit(
             request,
             event_type="record.read",
             resource_type="transcript_records",
             action="read",
-            metadata={"mode": "chronological", "limit": limit},
+            metadata={"mode": "chronological", "limit": limit, "offset": offset},
         )
         return JSONResponse(
             {
                 "mode": "chronological",
                 "records": [record.model_dump(mode="json") for record in records],
+                "pagination": {
+                    "offset": offset,
+                    "limit": limit,
+                    "total_count": total_count,
+                },
             }
         )
 
@@ -3568,13 +3647,12 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         content = str(payload.get("content", ""))
         content_base64 = str(payload.get("content_base64", ""))
         suffix = ".abhi" if import_format == "abhi" else ".json"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-            temp_path = Path(handle.name)
+        if import_format == "abhi" and content_base64:
+            data = base64.b64decode(content_base64)
+        else:
+            data = content.encode("utf-8")
+        temp_path = write_secure_temp(data, suffix=suffix)
         try:
-            if import_format == "abhi" and content_base64:
-                temp_path.write_bytes(base64.b64decode(content_base64))
-            else:
-                temp_path.write_text(content, encoding="utf-8")
             graph, _ = _require_http_scope(request, "graph:write")
             imported_node_ids: list[str] = []
             if import_format == "abhi":
@@ -3605,13 +3683,12 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         content = str(payload.get("content", ""))
         content_base64 = str(payload.get("content_base64", ""))
         suffix = ".abhi" if import_format == "abhi" else ".json"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-            temp_path = Path(handle.name)
+        if import_format == "abhi" and content_base64:
+            data = base64.b64decode(content_base64)
+        else:
+            data = content.encode("utf-8")
+        temp_path = write_secure_temp(data, suffix=suffix)
         try:
-            if import_format == "abhi" and content_base64:
-                temp_path.write_bytes(base64.b64decode(content_base64))
-            else:
-                temp_path.write_text(content, encoding="utf-8")
             graph, _ = _require_http_scope(request, "graph:read")
             if import_format == "abhi":
                 validation = graph.validate_abhi(input_path=temp_path)
@@ -3662,19 +3739,21 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         content_b = str(payload.get("content_b", ""))
         content_a_base64 = str(payload.get("content_a_base64", ""))
         content_b_base64 = str(payload.get("content_b_base64", ""))
-        with tempfile.NamedTemporaryFile(suffix=".abhi", delete=False) as handle_a:
-            path_a = Path(handle_a.name)
-        with tempfile.NamedTemporaryFile(suffix=".abhi", delete=False) as handle_b:
-            path_b = Path(handle_b.name)
+        if content_a_base64:
+            data_a = base64.b64decode(content_a_base64)
+        else:
+            data_a = content_a.encode("utf-8")
+        if content_b_base64:
+            data_b = base64.b64decode(content_b_base64)
+        else:
+            data_b = content_b.encode("utf-8")
+        path_a = write_secure_temp(data_a, suffix=".abhi")
         try:
-            if content_a_base64:
-                path_a.write_bytes(base64.b64decode(content_a_base64))
-            else:
-                path_a.write_text(content_a, encoding="utf-8")
-            if content_b_base64:
-                path_b.write_bytes(base64.b64decode(content_b_base64))
-            else:
-                path_b.write_text(content_b, encoding="utf-8")
+            path_b = write_secure_temp(data_b, suffix=".abhi")
+        except BaseException:
+            path_a.unlink(missing_ok=True)
+            raise
+        try:
             graph, _ = _require_http_scope(request, "graph:read")
             diff = graph.diff_abhi(input_path_a=path_a, input_path_b=path_b)
             snapshot_a = abhi_to_snapshot(load_abhi_document(path_a), fallback_tenant_id=graph.tenant_id)
@@ -3776,7 +3855,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         )
         return JSONResponse([_serialize_audit_event(event) for event in events])
 
-    app = Starlette(
+    raw_app = Starlette(
         routes=[
             Route("/health/live", live),
             Route("/health/ready", ready),
@@ -3811,7 +3890,7 @@ def create_http_application(app_server: WaggleServer, config: AppConfig) -> Star
         lifespan=service.lifespan,
         exception_handlers={WaggleError: waggle_error_handler},
     )
-    return app
+    return _RequestBodySizeMiddleware(raw_app, max_bytes=config.max_payload_bytes)
 
 
 def _run_graph_editor_command(config: AppConfig, args: argparse.Namespace) -> int:
@@ -3868,7 +3947,13 @@ async def run_stdio(config: AppConfig) -> None:
     app = get_app(config)
     graph = app._root_graph
     em = graph.embedding_model
-    if not config.is_fast_mode and hasattr(em, "start_background_warmup") and not getattr(em, "_warmup_started", False):
+    is_bundled_runtime = os.environ.get("WAGGLE_BUNDLED_RUNTIME", "").strip() in {"1", "true", "yes"}
+    if (
+        not is_bundled_runtime
+        and not config.is_fast_mode
+        and hasattr(em, "start_background_warmup")
+        and not getattr(em, "_warmup_started", False)
+    ):
         # Kick off background warmup so the first semantic call is fast.
         em.start_background_warmup()
     if config.is_strict_mode:
@@ -4171,6 +4256,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     clear_session.add_argument("--session-id", required=True)
     clear_session.add_argument("--yes", action="store_true", help="Confirm the destructive clear operation.")
+    clear_session.add_argument(
+        "--dry-run", action="store_true", help="Preview the clear operation without deleting data."
+    )
 
     clear_project = subparsers.add_parser(
         "clear-project",
@@ -4178,12 +4266,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     clear_project.add_argument("--project", required=True)
     clear_project.add_argument("--yes", action="store_true", help="Confirm the destructive clear operation.")
+    clear_project.add_argument(
+        "--dry-run", action="store_true", help="Preview the clear operation without deleting data."
+    )
 
     clear_all = subparsers.add_parser(
         "clear-all",
         help="Delete all graph memory data for the current tenant.",
     )
     clear_all.add_argument("--yes", action="store_true", help="Confirm the destructive clear operation.")
+    clear_all.add_argument("--dry-run", action="store_true", help="Preview the clear operation without deleting data.")
 
     import_abhi = subparsers.add_parser(
         "import",
@@ -4472,7 +4564,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--dry-run", action="store_true", help="Show what would change without writing files.")
     setup.add_argument("--run-doctor", action=argparse.BooleanOptionalAction, default=True)
-    setup.add_argument("--no-hooks", action="store_true", help="Skip Claude Code hook installation.")
+    setup.add_argument(
+        "--hooks",
+        default="auto",
+        help=(
+            "Which hook-capable tools to install automatic memory hooks for: "
+            "'auto' (all detected, currently Claude Code), 'none', or a comma-separated "
+            "list (currently supported: claude-code)."
+        ),
+    )
+    setup.add_argument(
+        "--no-hooks",
+        action="store_true",
+        help="Deprecated alias for --hooks none. Skip all hook installation.",
+    )
 
     subparsers.add_parser("init", help="Interactive setup wizard — configure an MCP client to use waggle-mcp.")
     subparsers.add_parser(
@@ -4494,6 +4599,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument(
         "--json",
+        "--as-json",
         dest="json_output",
         action="store_true",
         help="Print a machine-readable JSON report instead of the human-readable doctor output.",
@@ -4533,6 +4639,8 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
     }
     if args.command in _CLI_COMMAND_ALIASES:
         args.command = _CLI_COMMAND_ALIASES[args.command]
+    if args.command == "doctor":
+        return _run_doctor_command(config, args)
     backend = _build_backend(config)
     if args.command == "create-tenant":
         tenant = backend.ensure_tenant(args.tenant_id, args.name)
@@ -4670,23 +4778,27 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         if config.backend != "neo4j":
             raise ValidationFailure("migrate-sqlite requires WAGGLE_BACKEND=neo4j for the target environment.")
         source = MemoryGraph(
-            args.db_path, EmbeddingModel(config.model_name), tenant_id=args.tenant_id, export_dir=config.export_dir
+            args.db_path,
+            EmbeddingModel(
+                config.model_name,
+                embedding_backend=config.embedding_backend,
+            ),
+            tenant_id=args.tenant_id,
+            export_dir=config.export_dir,
         )
         target = backend.for_tenant(args.tenant_id)
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as handle:
-            temp_path = Path(handle.name)
-        backup = source.export_graph_backup(output_path=temp_path)
-        imported = target.import_graph_backup(input_path=temp_path)
-        print(
-            json.dumps(
-                {
-                    "backup": backup.model_dump(),
-                    "import": imported.model_dump(),
-                },
-                indent=2,
+        with secure_temp_path(suffix=".json") as temp_path:
+            backup = source.export_graph_backup(output_path=temp_path)
+            imported = target.import_graph_backup(input_path=temp_path)
+            print(
+                json.dumps(
+                    {
+                        "backup": backup.model_dump(),
+                        "import": imported.model_dump(),
+                    },
+                    indent=2,
+                )
             )
-        )
-        temp_path.unlink(missing_ok=True)
         return 0
     if args.command == "export":
         _assert_export_safe(
@@ -4751,21 +4863,24 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
         return 0
     if args.command == "clear-session":
-        if not bool(getattr(args, "yes", False)):
+        dry_run = bool(getattr(args, "dry_run", False))
+        if not dry_run and not bool(getattr(args, "yes", False)):
             raise ValidationFailure("clear-session is destructive and requires --yes.")
-        cleared = backend.clear_session(session_id=args.session_id)
+        cleared = backend.clear_session(session_id=args.session_id, dry_run=dry_run)
         print(json.dumps(cleared.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "clear-project":
-        if not bool(getattr(args, "yes", False)):
+        dry_run = bool(getattr(args, "dry_run", False))
+        if not dry_run and not bool(getattr(args, "yes", False)):
             raise ValidationFailure("clear-project is destructive and requires --yes.")
-        cleared = backend.clear_project(project=args.project)
+        cleared = backend.clear_project(project=args.project, dry_run=dry_run)
         print(json.dumps(cleared.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "clear-all":
-        if not bool(getattr(args, "yes", False)):
+        dry_run = bool(getattr(args, "dry_run", False))
+        if not dry_run and not bool(getattr(args, "yes", False)):
             raise ValidationFailure("clear-all is destructive and requires --yes.")
-        cleared = backend.clear_all()
+        cleared = backend.clear_all(dry_run=dry_run)
         print(json.dumps(cleared.model_dump(mode="json"), indent=2))
         return 0
     if args.command == "import":
@@ -4972,17 +5087,22 @@ def _run_admin_command(config: AppConfig, args: argparse.Namespace) -> int:
         print(_FEATURES_GUIDE)
         return 0
     if args.command == "doctor":
-        return _run_doctor(
-            config,
-            fix=bool(getattr(args, "fix", False)),
-            json_output=bool(getattr(args, "json_output", False)),
-        )
+        return _run_doctor_command(config, args)
     raise ValidationFailure(f"Unknown command: {args.command}")
 
 
 # ---------------------------------------------------------------------------
 # doctor command
 # ---------------------------------------------------------------------------
+
+
+def _run_doctor_command(config: AppConfig, args: argparse.Namespace) -> int:
+    return _run_doctor(
+        config,
+        fix=bool(getattr(args, "fix", False)),
+        json_output=bool(getattr(args, "json_output", False)),
+    )
+
 
 _KNOWN_CONFIG_PATHS: list[tuple[str, str]] = [
     # (label, path_template)
@@ -5021,6 +5141,7 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
     issues: list[str] = []
     warnings: list[str] = []
     ok_items: list[str] = []
+    checks: dict[str, dict[str, Any]] = {}
 
     def emit(*args: object, **kwargs: object) -> None:
         if not json_output:
@@ -5044,7 +5165,9 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
     for label, template in _KNOWN_CONFIG_PATHS:
         raw = template.replace("%APPDATA%", os.environ.get("APPDATA", "")).replace("%USERPROFILE%", str(Path.home()))
         path = Path(raw).expanduser()
-        if path.exists():
+        exists = path.exists()
+        has_waggle = False
+        if exists:
             try:
                 raw_text = path.read_text(encoding="utf-8", errors="replace")
                 if path.suffix == ".toml":
@@ -5076,26 +5199,41 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
             "No MCP client config file contains a 'waggle' server entry. "
             "Run 'waggle-mcp setup --yes' to create one, or add it manually."
         )
+        checks["mcp_config"] = {
+            "status": "fail",
+            "reason": "No MCP client config file contains a 'waggle' server entry.",
+        }
     else:
         ok_items.append(f"Waggle found in: {', '.join(waggle_found_in)}")
+        checks["mcp_config"] = {"status": "ok", "found_in": waggle_found_in}
 
     # ── 2. DB path ───────────────────────────────────────────────────────────
     emit(_c(_BOLD, "\n[2] Database path"))
     db_path = Path(config.db_path)
     db_dir = db_path.parent
-    if db_path.exists():
+    db_exists = db_path.exists()
+    db_dir_exists = db_dir.exists()
+    if db_exists:
         ok(f"DB file exists: {db_path}")
         ok_items.append("DB file found")
-    elif db_dir.exists():
+        checks["db_connection"] = {"status": "ok", "path": str(db_path)}
+    elif db_dir_exists:
         ok(f"DB directory exists (file will be created on first run): {db_path}")
         ok_items.append("DB directory writable")
+        checks["db_connection"] = {"status": "ok", "path": str(db_path)}
     else:
         issues.append(f"DB directory does not exist: {db_dir}. Create it with: mkdir -p <dir>")
         fail(f"DB directory missing: {db_dir}")
+        checks["db_connection"] = {
+            "status": "fail",
+            "reason": f"DB directory does not exist: {db_dir}. Create it with: mkdir -p <dir>",
+        }
 
     # ── 3. Embedding model ───────────────────────────────────────────────────
     emit(_c(_BOLD, "\n[3] Embedding model"))
     model_name = config.model_name
+    is_deterministic = model_name.strip().lower() in {"fake", "fake-model", "deterministic", "offline-demo"}
+    is_cached = False
     hf_home = (
         os.environ.get("HF_HOME")
         or os.environ.get("SENTENCE_TRANSFORMERS_HOME")
@@ -5103,9 +5241,10 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
     )
     st_cache = Path(os.environ.get("SENTENCE_TRANSFORMERS_HOME", Path(hf_home) / "hub"))
 
-    if model_name.strip().lower() in {"fake", "fake-model", "deterministic", "offline-demo"}:
+    if is_deterministic:
         ok(f"Model: {model_name!r}  (deterministic — no download, always offline-safe)")
         ok_items.append("Deterministic model — no download needed")
+        checks["embedding_model"] = {"status": "ok", "model_id": model_name}
     else:
         # Heuristic: look for a cached sentence-transformers directory
         safe_name = model_name.replace("/", "_").replace("\\", "_")
@@ -5114,10 +5253,11 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
             st_cache / safe_name,
             Path(hf_home) / "hub" / f"models--{safe_name.replace('_', '--', 1)}",
         ]
-        cached = any(p.exists() for p in possible_dirs)
-        if cached:
+        is_cached = any(p.exists() for p in possible_dirs)
+        if is_cached:
             ok(f"Model: {model_name!r}  (cached locally — fast startup)")
             ok_items.append("Embedding model cached")
+            checks["embedding_model"] = {"status": "ok", "model_id": model_name}
         else:
             emit(
                 f"  {_c(_CYAN, chr(0x2139))} Model: {model_name!r}  — NOT found in local cache.\n"
@@ -5125,14 +5265,17 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
                 f"    To avoid: set WAGGLE_MODEL=deterministic, or pre-download with:\n"
                 f"      python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('{model_name}')\""
             )
-            warnings.append(
+            reason = (
                 f"Embedding model '{model_name}' not found in cache. "
                 "First semantic call will block for a network download. "
                 "Set WAGGLE_MODEL=deterministic for offline-safe mode."
             )
+            warnings.append(reason)
+            checks["embedding_model"] = {"status": "warn", "model_id": model_name, "reason": reason}
 
-    # ── 4. WAGGLE_STARTUP_MODE ───────────────────────────────────────────────
+    # ── 4. Embedding store ───────────────────────────────────────────────────
     emit(_c(_BOLD, "\n[4] Embedding store"))
+    checks["graph_schema"] = {"status": "ok"}
     try:
         graph = _default_graph(config)
         if isinstance(graph, MemoryGraph):
@@ -5145,6 +5288,50 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
                 )
                 ok_items.append("Stale embeddings re-embedded")
                 store_health = graph.get_embedding_store_health()
+
+            checksum_failures = (
+                store_health["node_checksum_failures"]
+                + store_health["transcript_checksum_failures"]
+                + store_health["window_checksum_failures"]
+            )
+            if fix and checksum_failures:
+                cleared = graph.clear_corrupt_embeddings()
+                rebuilt = graph.reembed_stale_embeddings(batch_size=100)
+                windows_rebuilt = graph.recompute_stale_window_embeddings()
+                ok(
+                    "Cleared corrupt embeddings: "
+                    f"{cleared['transcript_records']} transcript, {cleared['nodes']} node, "
+                    f"{cleared['context_windows']} window rows; rebuilt "
+                    f"{rebuilt['transcript_rows_updated']} transcript, {rebuilt['node_rows_updated']} node and "
+                    f"{windows_rebuilt} window embeddings."
+                )
+                ok_items.append("Corrupt embeddings cleared and rebuilt")
+                store_health = graph.get_embedding_store_health()
+                checksum_failures = (
+                    store_health["node_checksum_failures"]
+                    + store_health["transcript_checksum_failures"]
+                    + store_health["window_checksum_failures"]
+                )
+            if fix and store_health["window_stale_rows"]:
+                # Repair stale window embeddings even when nothing failed its checksum
+                # (membership changes flag windows stale without corrupting anything);
+                # the corrupt-clear path above only runs on failures.
+                windows_rebuilt = graph.recompute_stale_window_embeddings()
+                ok(f"Recomputed stale context-window embeddings: {windows_rebuilt} window rows.")
+                if windows_rebuilt:
+                    ok_items.append("Stale context-window embeddings recomputed")
+                store_health = graph.get_embedding_store_health()
+                checksum_failures = (
+                    store_health["node_checksum_failures"]
+                    + store_health["transcript_checksum_failures"]
+                    + store_health["window_checksum_failures"]
+                )
+
+            legacy_rows = (
+                store_health["node_legacy_rows"]
+                + store_health["transcript_legacy_rows"]
+                + store_health["window_legacy_rows"]
+            )
             transcript_models = store_health["transcript_model_counts"]
             node_models = store_health["node_model_counts"]
             emit(f"  Current model id: {store_health['current_model_id']}")
@@ -5152,16 +5339,75 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
             emit(f"  Node model ids: {node_models or '{}'}")
             emit(f"  Stale transcript rows: {store_health['transcript_stale_rows']}")
             emit(f"  Stale node rows: {store_health['node_stale_rows']}")
+
+            store_status = "ok"
+            store_reason: str | None = None
             if store_health["mixed_models"]:
                 issues.append("Mixed embedding_model_id values detected in the store.")
                 fail("Mixed embedding model IDs detected across transcript_records/nodes.")
+                store_status = "fail"
+                store_reason = "Mixed embedding_model_id values detected across transcript_records/nodes."
             else:
                 ok("Store model IDs are consistent.")
                 ok_items.append("Embedding store model IDs consistent")
+
+            if checksum_failures:
+                issues.append(f"{checksum_failures} embedding row(s) fail the integrity checksum (corruption).")
+                fail(
+                    "Embedding checksum failures: "
+                    f"{store_health['transcript_checksum_failures']} transcript rows, "
+                    f"{store_health['node_checksum_failures']} node rows, "
+                    f"{store_health['window_checksum_failures']} window rows. "
+                    "Run 'waggle-mcp doctor --fix' to clear and rebuild them."
+                )
+                store_status = "fail"
+                if store_reason is None:
+                    store_reason = f"{checksum_failures} embedding row(s) fail the integrity checksum (corruption)."
+            elif legacy_rows:
+                emit("  No checksum failures in checksummed rows; legacy rows cannot be checksum-verified yet.")
+                warnings.append(
+                    f"{legacy_rows} embedding row(s) use the legacy pre-checksum format "
+                    "and cannot be checksum-verified until rewritten."
+                )
+                if store_status == "ok":
+                    store_status = "warn"
+                    store_reason = (
+                        f"{legacy_rows} embedding row(s) use the legacy pre-checksum format "
+                        "and cannot be checksum-verified until rewritten."
+                    )
+            else:
+                ok("All stored embeddings pass the integrity checksum.")
+                ok_items.append("Embedding checksums verified")
+            if legacy_rows:
+                emit(
+                    "  Pre-checksum (legacy) rows: "
+                    f"{store_health['transcript_legacy_rows']} transcript, {store_health['node_legacy_rows']} node, "
+                    f"{store_health['window_legacy_rows']} window (upgraded automatically on next write)."
+                )
+
+            graph_schema_check: dict[str, Any] = {
+                "status": store_status,
+                "current_model_id": store_health["current_model_id"],
+                "transcript_model_counts": transcript_models,
+                "node_model_counts": node_models,
+                "transcript_stale_rows": store_health["transcript_stale_rows"],
+                "node_stale_rows": store_health["node_stale_rows"],
+                "window_stale_rows": store_health["window_stale_rows"],
+                "mixed_models": store_health["mixed_models"],
+                "checksum_failures": checksum_failures,
+                "transcript_checksum_failures": store_health["transcript_checksum_failures"],
+                "node_checksum_failures": store_health["node_checksum_failures"],
+                "window_checksum_failures": store_health["window_checksum_failures"],
+                "legacy_rows": legacy_rows,
+            }
+            if store_reason is not None:
+                graph_schema_check["reason"] = store_reason
+            checks["graph_schema"] = graph_schema_check
     except Exception as exc:
         message = f"Embedding store check failed: {type(exc).__name__}: {exc}"
         issues.append(message)
         fail(message)
+        checks["graph_schema"] = {"status": "fail", "reason": message}
 
     # ── 5. WAGGLE_STARTUP_MODE ───────────────────────────────────────────────
     emit(_c(_BOLD, "\n[5] Startup mode"))
@@ -5169,21 +5415,25 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
     if config.is_fast_mode:
         ok("fast mode: zero ML overhead. Schema/tool listing only. Semantic tools return 'unavailable'.")
         ok_items.append("Startup mode: fast")
+        checks["startup_mode"] = {"status": "ok", "mode": "fast"}
     elif config.is_strict_mode:
         ok("strict mode: server blocks on startup until embedding model is ready.")
         ok_items.append("Startup mode: strict")
+        checks["startup_mode"] = {"status": "ok", "mode": "strict"}
     else:
         ok("normal mode: embedding loads in background. First semantic call may wait up to ~30 s.")
         ok_items.append("Startup mode: normal")
+        checks["startup_mode"] = {"status": "ok", "mode": "normal"}
 
     # ── 6. Windows stdout encoding ───────────────────────────────────────────
     if sys.platform == "win32":
         emit(_c(_BOLD, "\n[6] Windows stdout encoding"))
-        enc = getattr(sys.stdout, "encoding", None) or "unknown"
-        normalized_encoding = enc.lower().replace("-", "").replace("_", "")
-        if normalized_encoding in ("utf8", "cp65001"):
+        enc = getattr(sys.stdout, "encoding", "unknown")
+        is_utf8 = enc.lower().replace("-", "") in ("utf8", "utf8")
+        if is_utf8:
             ok(f"stdout encoding: {enc}")
             ok_items.append("Windows stdout is UTF-8")
+            checks["stdout_encoding"] = {"status": "ok", "encoding": enc}
         else:
             fail(
                 f"stdout encoding is {enc!r} (not UTF-8). "
@@ -5191,7 +5441,11 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
                 "    Fix: run with 'python -X utf8' or add at script top:\n"
                 "      import sys; sys.stdout.reconfigure(encoding='utf-8')"
             )
-            issues.append(f"Windows stdout encoding is {enc!r} — set PYTHONUTF8=1 or use python -X utf8.")
+            reason = f"Windows stdout encoding is {enc!r} — set PYTHONUTF8=1 or use python -X utf8."
+            issues.append(reason)
+            checks["stdout_encoding"] = {"status": "fail", "encoding": enc, "reason": reason}
+    else:
+        checks["stdout_encoding"] = {"status": "ok"}
 
     # ── 7. Known gotchas ─────────────────────────────────────────────────────
     emit(_c(_BOLD, "\n[7] Known API gotchas"))
@@ -5199,23 +5453,16 @@ def _run_doctor(config: AppConfig, *, fix: bool = False, json_output: bool = Fal
 
     # ── Summary ──────────────────────────────────────────────────────────────
     if json_output:
-        status = "issues_found" if issues else "warnings" if warnings else "ok"
-        print(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "platform": sys.platform,
-                    "status": status,
-                    "issues": issues,
-                    "warnings": warnings,
-                    "successful_checks": ok_items,
-                    "fix_requested": bool(fix),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return 1 if issues else 0
+        summary = {"ok": 0, "warn": 0, "fail": 0}
+        for check in checks.values():
+            summary[check["status"]] += 1
+        result = {
+            "version": __version__,
+            "checks": checks,
+            "summary": summary,
+        }
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 1 if summary["fail"] else 0
 
     print(_c(_BOLD, "─" * 50))
     if issues:
@@ -5564,7 +5811,7 @@ def _write_codex(db_path: str, python_exe: str) -> Path:
     pattern = re.compile(r"(?ms)^\[mcp_servers\.waggle\]\n.*?(?=^\[(?!mcp_servers\.waggle(?:\.env)?\])[^\n]+\]\n|\Z)")
     replacement = toml_block.rstrip() + "\n"
     if pattern.search(existing):
-        updated = pattern.sub(replacement, existing, count=1)
+        updated = pattern.sub(lambda m: replacement, existing, count=1)
     else:
         separator = "\n\n" if existing.strip() else ""
         updated = existing.rstrip() + separator + replacement
@@ -5688,6 +5935,48 @@ def _setup_clients_from_args(raw_clients: str) -> list[str]:
         detected = _detect_setup_clients()
         return detected or ["Codex"]
     return _normalize_setup_clients(raw_clients)
+
+
+# ── Hook-capable tool selection ──────────────────────────────────
+# Hooks are currently Claude-Code-specific (written to ~/.claude/settings.json),
+# separate from the MCP client config writers above. This map is the extension
+# point for future hook-capable tools.
+_HOOK_TOOL_ALIASES = {
+    "claude-code": "Claude Code",
+    "claude_code": "Claude Code",
+    "claudecode": "Claude Code",
+}
+_ALL_HOOK_TOOLS = ["Claude Code"]
+
+
+def _hook_tools_from_args(raw_hooks: str, no_hooks: bool) -> list[str]:
+    """Resolve which hook-capable tools should receive automatic memory hooks.
+
+    'auto' selects all hook-capable tools (currently Claude Code); 'none' selects
+    none. --no-hooks is a deprecated alias for --hooks none. A comma-separated
+    list selects specific tools by alias.
+    """
+    raw = (raw_hooks or "auto").strip().lower()
+    if no_hooks:
+        raw = "none"
+    if raw == "none":
+        return []
+    if raw == "auto":
+        return list(_ALL_HOOK_TOOLS)
+    tools: list[str] = []
+    for part in raw.split(","):
+        key = part.strip().lower()
+        if not key:
+            continue
+        tool = _HOOK_TOOL_ALIASES.get(key)
+        if tool is None:
+            supported = ", ".join(sorted(_HOOK_TOOL_ALIASES))
+            raise ValidationFailure(f"Unsupported hook target: {part!r}. Supported values: auto, none, {supported}.")
+        if tool not in tools:
+            tools.append(tool)
+    if not tools:
+        raise ValidationFailure("No hook targets were provided.")
+    return tools
 
 
 # ── Claude Code hook constants ────────────────────────────────────────────────
@@ -5987,6 +6276,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     db_path = str(Path(db_path_raw).expanduser().resolve())
     python_exe = _python_exe()
     clients = _setup_clients_from_args(args.clients)
+    hook_tools = _hook_tools_from_args(getattr(args, "hooks", "auto"), bool(getattr(args, "no_hooks", False)))
 
     print()
     print(_c(_BOLD, "waggle-mcp setup"))
@@ -5998,6 +6288,9 @@ def _run_setup(args: argparse.Namespace) -> int:
         print("  mode: dry-run")
         for client in clients:
             _ok(f"Would configure {client}")
+        if "Claude Code" in hook_tools:
+            hooks_path = _find_claude_settings()
+            _ok(f"Would install Claude Code hooks in {hooks_path}")
         if args.project_instructions and "Codex" in clients:
             agents_path = (Path.cwd() / "AGENTS.md").resolve()
             _ok(f"Would write Codex automatic-memory instructions to {agents_path}")
@@ -6034,24 +6327,24 @@ def _run_setup(args: argparse.Namespace) -> int:
         print(f"  {_c(_CYAN, chr(0x27A1))}  {_RESTART_HINTS[client]}")
     print()
 
-    # Install Claude Code hooks if not suppressed
-    no_hooks = bool(getattr(args, "no_hooks", False))
-    if not no_hooks and not args.dry_run:
-        hook_dir = Path(__file__).resolve().parent / "hooks" / "claude_code"
-        if hook_dir.exists():
-            try:
-                hooks_path = _install_claude_hooks(hook_dir)
-                if hooks_path is not None:
-                    _ok(f"Claude Code hooks installed in {hooks_path}")
-            except OSError as exc:
-                # Non-fatal: hooks are optional
-                LOGGER.warning("claude_hooks_install_failed", extra={"error": str(exc)})
+    # Install automatic memory hooks for the selected hook-capable tools
+    if hook_tools and not args.dry_run:
+        if "Claude Code" in hook_tools:
+            hook_dir = Path(__file__).resolve().parent / "hooks" / "claude_code"
+            if hook_dir.exists():
+                try:
+                    hooks_path = _install_claude_hooks(hook_dir)
+                    if hooks_path is not None:
+                        _ok(f"Claude Code hooks installed in {hooks_path}")
+                except OSError as exc:
+                    # Non-fatal: hooks are optional
+                    LOGGER.warning("claude_hooks_install_failed", extra={"error": str(exc)})
 
     if args.run_doctor:
         doctor_config = AppConfig.from_env()
         doctor_config.db_path = db_path
         doctor_config.model_name = args.model
-        doctor_exit = _run_doctor(doctor_config)
+        doctor_exit = _run_doctor_command(doctor_config, args)
         if doctor_exit:
             print(_c(_CYAN, "Setup completed; doctor reported follow-up warnings above."))
         return 0
@@ -6173,13 +6466,7 @@ def main() -> None:
     if command == "doctor":
         # Doctor only needs the config — not a live backend connection.
         config = AppConfig.from_env()
-        sys.exit(
-            _run_doctor(
-                config,
-                fix=bool(getattr(args, "fix", False)),
-                json_output=bool(getattr(args, "json_output", False)),
-            )
-        )
+        sys.exit(_run_admin_command(config, args))
 
     config = AppConfig.from_env()
     if command == "serve" and getattr(args, "transport", None):

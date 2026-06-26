@@ -4,16 +4,17 @@ Thank you for your interest in improving Waggle. This document covers everything
 
 ---
 
+
 ## Table of Contents
 
 - [Getting Started](#getting-started)
 - [First Contribution Paths](#first-contribution-paths)
 - [Project Architecture](#project-architecture)
 - [Running Tests](#running-tests)
+- [Writing Tests](#writing-tests)      <-- ADD THIS LINE
 - [Code Style](#code-style)
 - [Key Concepts](#key-concepts)
 - [How to Submit a PR](#how-to-submit-a-pr)
-
 ---
 
 ## Getting Started
@@ -31,9 +32,23 @@ source .venv/bin/activate     # macOS/Linux
 # 3. Install project + all dev tools (ruff, mypy, pytest)
 pip install -e ".[dev]"
 
-# 4. Verify the setup
+# 4. Install pre-commit hooks (recommended)
+# One-time setup: wires up the existing .pre-commit-config.yaml so ruff
+# check and format run automatically before every commit.
+pre-commit install
+
+# 5. Verify the setup
 waggle-mcp --help
 ```
+
+### Before opening an issue
+
+Install Waggle from PyPI first and reproduce the problem with the shipped package:
+
+- PyPI: https://pypi.org/project/waggle-mcp/
+- VS Code extension: https://marketplace.visualstudio.com/items?itemName=Abhigyan-Shekhar.waggle-memory
+
+This is the expected baseline for issue creation. It helps contributors and maintainers confirm whether the issue reproduces in the published package and the supported editor integration before debugging source-level changes.
 
 ## First Contribution Paths
 
@@ -58,12 +73,35 @@ The same document also defines the root layout policy. As a rule, do not add new
 
 ### Labeling guidance
 
-- Use `good first issue` for small, well-scoped tasks with clear acceptance criteria.
-- Use `help wanted` for larger tasks that are still open to external contributors.
+#### Maintainer Triage Checklist
+
+When reviewing a new issue:
+
+- Start with `needs-triage` until scope and priority are confirmed.
+- Use `good first issue` for small, well-scoped tasks with clear acceptance criteria and a limited blast radius.
+- Use `help wanted` for larger tasks that are suitable for external contributors but may require more project context.
+- Use `blocked` when progress depends on an external decision, dependency, or unresolved prerequisite.
+
+Quick checklist:
+
+- [ ] Is the issue clearly described?
+- [ ] Does it have defined acceptance criteria?
+- [ ] Should it be labeled `good first issue` or `help wanted`?
+- [ ] Does it need a domain label such as `documentation`, `graph`, `windows`, or `tooling`?
+- [ ] Is the issue currently blocked by another task or decision?
+
 - Add one domain label where possible, such as `graph`, `retrieval`, `windows`, `tooling`, or `documentation`.
-- New issues should usually start as `needs-triage` until a maintainer confirms scope and priority.
 
 Repository labels are defined in [`.github/labels.yml`](./.github/labels.yml) and synced with [`scripts/sync_github_labels.py`](./scripts/sync_github_labels.py). Use `--dry-run` first before changing live labels.
+
+To prevent contributor docs from referencing renamed or deleted labels, the repository has an automated drift checker:
+```bash
+python scripts/check_label_refs.py
+```
+If you rename or remove a label:
+1. Run the script to detect mismatching references in `CONTRIBUTING.md` and `docs/good-first-issues.md`.
+2. Update the document references to match the new label names.
+3. Commit and push the changes. The check runs automatically on pull requests.
 
 ---
 
@@ -100,6 +138,51 @@ query_graph() / build_context()
     └─► HybridRetriever.retrieve()             ← vector + BM25 + graph
     └─► MemoryGraph._expand_node_depths()      ← graph traversal
     └─► RecursiveContextController.assemble()  ← token-budgeted pack
+```
+
+
+
+
+### Observe conversation flow
+
+```mermaid
+flowchart LR
+    A[Conversation input] --> B[observe_conversation]
+    B --> C[intelligence.extract_conversation_candidates]
+    C --> D[MemoryGraph.store_node]
+    C --> F[MemoryGraph.store_edge]
+    D --> E[Embedding generation]
+    D --> G[(SQLite or Neo4j)]
+    F --> G
+```
+
+Note: The runtime instantiates either MemoryGraph (SQLite) or Neo4jMemoryGraph based on config.backend.
+
+
+### Query graph flow
+
+```mermaid
+flowchart LR
+    A[Query input] --> B[query_graph / build_context]
+    B --> C[EmbeddingModel.embed query]
+    C --> D[HybridRetriever.retrieve]
+    D --> E[MemoryGraph._expand_node_depths]
+    E --> F[RecursiveContextController.assemble]
+    F --> G[Context returned]
+    D --> H[(SQLite or Neo4j)]
+```
+
+### Transport layer
+
+```mermaid
+flowchart TB
+    Client -->|HTTP| S[server.py]
+    Client -->|MCP| S
+    S --> OC[observe_conversation]
+    S --> QG[query_graph / build_context]
+    OC --> G[(SQLite or Neo4j)]
+    QG --> G
+
 ```
 
 ### Scoping / Tenancy
@@ -152,7 +235,18 @@ WAGGLE_MODEL=deterministic pytest -v --tb=short
 If you change benchmark-facing numbers, regenerate the corresponding artifacts and update `tests/artifacts/README.md`.
 
 ---
+### Writing Tests
 
+Follow these rules when adding tests to the repository:
+
+* **File naming:** Test files must mirror the source code layout. Name your test file `tests/test_<module>.py` to match its source file at `src/waggle/<module>.py`.
+* **Test naming:** Use descriptive names indicating the behavior and condition being tested. Format your functions as `test_<function_or_behavior>_<condition>` (e.g., `test_hash_api_key_same_input_produces_same_hash`).
+* **Fixtures:** Use standard pytest fixtures to isolate environments. Use `tmp_path` for filesystem interactions, `monkeypatch.setenv` for environment variables, and `capsys` for capturing stdout. Always use `WAGGLE_MODEL=deterministic` unless explicitly testing live embedding quality.
+* **Construct real objects:** Instantiate actual Pydantic models from `src/waggle/models.py` rather than using raw dictionaries (`dicts`) or loose mocks. This ensures breaking schema changes or field renames fail the test suite instantly.
+* **What makes a test meaningful:** A test must fail when the behavior it checks is broken. If you can delete or bypass the underlying code under test and the test suite still passes, the test is invalid.
+* **One function per behavior:** Do not bundle multiple unrelated assertions into a single test function. Keeping tests isolated ensures failure logs remain specific and actionable.
+
+---
 ## Code Style
 
 This project uses [ruff](https://docs.astral.sh/ruff/) for both linting and formatting.
@@ -195,16 +289,59 @@ Portable memory snapshots. JSON underneath with optional AES-256-GCM encryption,
 
 ### WAGGLE_MODEL=deterministic
 The offline-safe embedding mode. Uses SHA-256 hashing to produce a 256-dim float32 vector. Slightly lower retrieval quality than sentence-transformers but instant startup and zero network dependency. **Use this in tests.**
+### WAGGLE_EMBEDDING_BACKEND
 
----
+Controls which backend Sentence Transformers uses for embedding inference.
+
+**Default:** `pytorch`
+
+**Allowed values:**
+- `pytorch`
+- `onnx`
+
+Example:
+
+```bash
+export WAGGLE_EMBEDDING_BACKEND=onnx
+```
+
+### ONNX Runtime Requirements
+
+Using `WAGGLE_EMBEDDING_BACKEND=onnx` requires additional ONNX runtime dependencies.
+
+Install the required packages:
+
+```bash
+pip install onnxruntime optimum
+``` 
+
+Then configure:
+
+```bash
+export WAGGLE_EMBEDDING_BACKEND=onnx
+```
+
+Supported values:
+- `pytorch` (default)
+- `onnx`
+
+If ONNX dependencies are unavailable, model initialization may fail and Waggle will fall back to deterministic embeddings.
+
+Use the default `pytorch` backend unless you specifically want ONNX Runtime inference.
 
 ## How to Submit a PR
 
 1. **Open an issue first** for bugs, doc gaps, or feature proposals — especially larger changes.
+   Install and verify the current PyPI package and the VS Code extension before filing:
+   `https://pypi.org/project/waggle-mcp/`
+   `https://marketplace.visualstudio.com/items?itemName=Abhigyan-Shekhar.waggle-memory`
+   If an issue does not include a screenshot of the problem, it will not be considered.
 2. **Fork and branch** from `main`. Use a descriptive branch name like `fix/dockerfile-version` or `feat/dry-run-import`.
 3. **Keep PRs focused.** One logical change per PR makes review faster.
 4. **Write a clear description.** Explain *what* changed, *why* it was needed, and how you verified it. Link the issue with `Fixes #123` or explain why no issue is needed.
-5. **Run tests before pushing:**
+5. **Run tests before pushing.** If you ran `pre-commit install` during setup,
+   `ruff check` and `ruff format` run automatically on every commit; otherwise
+   run them manually alongside the test suite:
    ```bash
    WAGGLE_MODEL=deterministic pytest -q
    ruff check src/ tests/
@@ -213,14 +350,16 @@ The offline-safe embedding mode. Uses SHA-256 hashing to produce a 256-dim float
 6. **Benchmark changes:** If your PR affects retrieval quality or token efficiency, include updated artifact links under `tests/artifacts/`.
 7. **Open the PR** — CI will run automatically and the maintainer will review.
 
+
 ### Pull Request Format
 
 Use the repository PR template and keep these sections complete:
 
-- Summary: concise bullets describing the user-visible or maintainer-visible change.
-- Testing: exact commands run, or a clear reason when a check was not run.
-- Checklist: issue link, docs impact, focused scope, and confirmation that no secrets or generated noise were committed.
-- Implementation notes: for non-trivial code, include a short walkthrough of the approach so reviewers can tell that you understand the change.
+- **Summary**: Concise bullets describing the user-visible or maintainer-visible change.
+- **Testing**: Exact commands run to verify the change.
+- **Test report**: Proof that the test suite is passing (e.g., a screenshot).
+- **Checklist**: Confirmation of issue linking, docs updates, and focused scope.
+- **Implementation notes**: For non-trivial code, include a short walkthrough of the approach.
 
 Maintainers may ask you to explain your implementation before approval. PRs that cannot be explained by the contributor will not be merged.
 

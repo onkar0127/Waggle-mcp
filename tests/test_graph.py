@@ -23,7 +23,7 @@ from waggle.abhi import (
     write_abhi_document,
 )
 from waggle.errors import ValidationFailure
-from waggle.graph import MemoryGraph
+from waggle.graph import MemoryGraph, _ReadWriteLock
 from waggle.models import NodeType, RelationType
 
 
@@ -349,6 +349,36 @@ def test_semantic_duplicate_nodes_reuse_existing_entry(tmp_path: Path) -> None:
     assert second.created is False
     assert second.node.id == first.node.id
     assert second.dedup_reason == "same_label_high_similarity"
+
+
+def test_node_cosine_similarity_logs_and_reraises_errors(tmp_path, caplog):
+    import logging
+
+    graph = MemoryGraph(
+        tmp_path / "cosine.db",
+        FakeEmbeddingModel(),
+    )
+
+    node_a = graph.add_node(
+        label="A",
+        content="hello",
+        node_type=NodeType.ENTITY,
+    ).node
+
+    node_b = graph.add_node(
+        label="B",
+        content="world",
+        node_type=NodeType.ENTITY,
+    ).node
+
+    def broken_from_bytes(*args, **kwargs):
+        raise RuntimeError("embedding decode failed")
+
+    graph.embedding_model.from_bytes = broken_from_bytes
+    with caplog.at_level(logging.WARNING):
+        result = graph._node_cosine_similarity(node_a, node_b)
+        assert result is None
+        assert any("Failed to compute cosine similarity" in record.message for record in caplog.records)
 
 
 def test_entity_resolution_reuses_acronym_matches(tmp_path: Path) -> None:
@@ -1721,16 +1751,22 @@ def test_observe_conversation_creates_database_contradiction_edges(tmp_path: Pat
 
 def test_query_supports_temporal_latest_and_oldest_bias(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
-    graph.add_node(
+
+    node_v1 = graph.add_node(
         label="Auth v1",
         content="Auth architecture originally used JWT sessions",
         node_type=NodeType.CONCEPT,
-    )
-    graph.add_node(
+    ).node
+
+    node_v2 = graph.add_node(
         label="Auth v2",
         content="Auth architecture now uses rotating JWT tokens",
         node_type=NodeType.CONCEPT,
-    )
+    ).node
+
+    # Explicitly set distinct timestamps to bypass Windows clock resolution issues
+    _set_node_timestamp(graph, node_v1.id, datetime(2024, 1, 1, tzinfo=UTC))
+    _set_node_timestamp(graph, node_v2.id, datetime(2024, 1, 2, tzinfo=UTC))
 
     latest = graph.query(
         query="latest auth architecture", max_nodes=1, max_depth=0, retrieval_mode="graph"
@@ -1915,16 +1951,22 @@ def test_temporal_original_phrase_prefers_oldest_state(tmp_path: Path) -> None:
 
 def test_now_phrase_prefers_current_backend_choice(tmp_path: Path) -> None:
     graph = make_graph(tmp_path)
-    graph.add_node(
+
+    node_old = graph.add_node(
         label="Redis session cache",
         content="Redis handles session caching because TTL support is simple.",
         node_type=NodeType.FACT,
-    )
-    graph.add_node(
+    ).node
+
+    node_new = graph.add_node(
         label="KeyDB session cache",
         content="KeyDB now handles session caching for active-active failover.",
         node_type=NodeType.FACT,
-    )
+    ).node
+
+    # Explicitly set distinct timestamps
+    _set_node_timestamp(graph, node_old.id, datetime(2024, 1, 1, tzinfo=UTC))
+    _set_node_timestamp(graph, node_new.id, datetime(2024, 1, 2, tzinfo=UTC))
 
     result = graph.query(query="which cache backend handles sessions now", max_nodes=1, max_depth=0)
 
@@ -2254,3 +2296,68 @@ def test_abhi_json_file_raises_validation_failure(tmp_path: Path) -> None:
     json_file.write_text('{"graph": {}}', encoding="utf-8")
     with pytest.raises(VF, match=r"not a valid \.abhi file"):
         load_abhi_document(json_file)
+
+
+def test_clear_scope_dry_run_and_audit_trail(tmp_path: Path) -> None:
+    graph = make_graph(tmp_path)
+
+    # 1. Add some initial scope-scoped data
+    graph.add_node(
+        label="Test Node",
+        content="Use Redis for caching.",
+        node_type=NodeType.DECISION,
+        project="test_proj",
+        session_id="test_sess",
+    )
+    graph.observe_conversation(
+        user_message="Use Redis for caching.",
+        assistant_response="Noted.",
+        project="test_proj",
+        session_id="test_sess",
+    )
+
+    # Verify we have nodes
+    stats_before = graph.get_stats()
+    assert stats_before.total_nodes > 0
+
+    # 2. Perform a dry-run clear on the session
+    result_dry = graph.clear_session(session_id="test_sess", dry_run=True)
+    assert result_dry.dry_run is True
+    assert result_dry.deleted_nodes > 0
+    assert result_dry.deleted_transcripts > 0
+    assert any(k in result_dry.counts_by_node_type for k in ("decision", "note", "entity", "fact"))
+
+    # Verify data is STILL in the graph
+    stats_after_dry = graph.get_stats()
+    assert stats_after_dry.total_nodes == stats_before.total_nodes
+
+    # Verify NO audit event was emitted for this dry-run
+    events_dry = graph.list_audit_events(event_type="graph.scope_cleared")
+    assert len(events_dry) == 0
+
+    # 3. Perform a real clear on the session
+    result_real = graph.clear_session(session_id="test_sess", dry_run=False)
+    assert result_real.dry_run is False
+    assert result_real.deleted_nodes == result_dry.deleted_nodes
+    assert result_real.deleted_transcripts == result_dry.deleted_transcripts
+
+    # Verify data is DELETED
+    stats_after_real = graph.get_stats()
+    assert stats_after_real.total_nodes < stats_before.total_nodes
+
+    # Verify audit event WAS emitted for this real clear
+    events_real = graph.list_audit_events(event_type="graph.scope_cleared")
+    assert len(events_real) == 1
+    assert events_real[0].resource_type == "session"
+    assert events_real[0].resource_id == "test_sess"
+    # Verify structured counts are inside metadata
+    meta = events_real[0].metadata
+    assert meta["dry_run"] is False
+    assert meta["deleted_nodes"] == result_real.deleted_nodes
+
+
+def test_read_to_write_lock_upgrade_raises_runtime_error() -> None:
+    lock = _ReadWriteLock()
+
+    with lock.read(), pytest.raises(RuntimeError, match="Cannot upgrade a read lock to a write lock"), lock:
+        pass

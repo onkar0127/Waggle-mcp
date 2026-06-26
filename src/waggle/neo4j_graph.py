@@ -31,6 +31,7 @@ from waggle.auth import api_key_prefix, generate_api_key, hash_api_key, verify_a
 from waggle.context_bundle import build_context_bundle, build_query_summary, export_context_bundle_files
 from waggle.errors import AuthenticationError, ValidationFailure
 from waggle.evidence import build_observation_evidence, merge_evidence_records, merge_validity_windows
+from waggle.graph import decode_embedding_blob
 from waggle.intelligence import (
     canonical_concept_overlap,
     compatible_node_types,
@@ -338,6 +339,18 @@ class Neo4jMemoryGraph:
                 """
                 CREATE INDEX waggle_transcript_tenant_session_turn IF NOT EXISTS
                 FOR (t:MemoryTranscript) ON (t.tenant_id, t.session_id, t.turn_index)
+                """
+            ).consume()
+            session.run(
+                """
+                CREATE INDEX waggle_transcript_tenant_project IF NOT EXISTS
+                FOR (t:MemoryTranscript) ON (t.tenant_id, t.project)
+                """
+            ).consume()
+            session.run(
+                """
+                CREATE INDEX waggle_transcript_tenant_agent IF NOT EXISTS
+                FOR (t:MemoryTranscript) ON (t.tenant_id, t.agent_id)
                 """
             ).consume()
             session.run(
@@ -1878,7 +1891,6 @@ def update_node(
     valid_to: datetime | None = None,
     evidence_records: list[EvidenceRecord] | None = None,
 ) -> Node:
-
     if (
         content is None
         and label is None
@@ -4166,11 +4178,15 @@ def update_node(
 
     def _insert_snapshot_node(self, session: Any, raw_node: dict[str, Any]) -> None:
         embedding_bytes = raw_node.get("embedding")
-        embedding = (
-            np.frombuffer(embedding_bytes, dtype=np.float32).astype(np.float32).tolist()
-            if isinstance(embedding_bytes, bytes)
-            else self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
-        )
+        # Validate the checksum (issue #71) and strip the trailer before
+        # converting. A legacy/corrupt blob can decode to a length that is not a
+        # whole number of float32 values; np.frombuffer would raise and abort the
+        # import, so fall back to re-embedding instead.
+        raw = decode_embedding_blob(embedding_bytes) if isinstance(embedding_bytes, bytes) else None
+        if raw is not None and len(raw) % np.dtype(np.float32).itemsize == 0:
+            embedding = np.frombuffer(raw, dtype=np.float32).astype(np.float32).tolist()
+        else:
+            embedding = self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
         session.run(
             """
             CREATE (n:MemoryNode {
@@ -4200,11 +4216,15 @@ def update_node(
 
     def _update_snapshot_node(self, session: Any, raw_node: dict[str, Any]) -> None:
         embedding_bytes = raw_node.get("embedding")
-        embedding = (
-            np.frombuffer(embedding_bytes, dtype=np.float32).astype(np.float32).tolist()
-            if isinstance(embedding_bytes, bytes)
-            else self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
-        )
+        # Validate the checksum (issue #71) and strip the trailer before
+        # converting. A legacy/corrupt blob can decode to a length that is not a
+        # whole number of float32 values; np.frombuffer would raise and abort the
+        # import, so fall back to re-embedding instead.
+        raw = decode_embedding_blob(embedding_bytes) if isinstance(embedding_bytes, bytes) else None
+        if raw is not None and len(raw) % np.dtype(np.float32).itemsize == 0:
+            embedding = np.frombuffer(raw, dtype=np.float32).astype(np.float32).tolist()
+        else:
+            embedding = self.embedding_model.embed(raw_node["content"]).astype(np.float32).tolist()
         session.run(
             """
             MATCH (n:MemoryNode {tenant_id: $existing_tenant_id, id: $id})

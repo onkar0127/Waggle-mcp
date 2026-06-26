@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +10,9 @@ import numpy as np
 import pytest
 
 import waggle
+import waggle.server as server_module
 from waggle.config import AppConfig
+from waggle.errors import ValidationFailure
 from waggle.graph import MemoryGraph
 from waggle.models import NodeType, RelationType
 from waggle.server import (
@@ -17,6 +21,7 @@ from waggle.server import (
     _assert_runtime_feature_parity,
     _build_parser,
     _default_graph,
+    _hook_tools_from_args,
     _run_admin_command,
     _run_doctor,
     _run_graph_editor_command,
@@ -199,8 +204,11 @@ def test_parser_accepts_graph_editor_commands() -> None:
         ["checkpoint-context", "--project", "MCP", "--session-id", "thread-1", "--output", "handoff.abhi"]
     )
     clear_session_args = parser.parse_args(["clear-session", "--session-id", "thread-1", "--yes"])
+    clear_session_dry_run_args = parser.parse_args(["clear-session", "--session-id", "thread-1", "--dry-run"])
     clear_project_args = parser.parse_args(["clear-project", "--project", "MCP", "--yes"])
+    clear_project_dry_run_args = parser.parse_args(["clear-project", "--project", "MCP", "--dry-run"])
     clear_all_args = parser.parse_args(["clear-all", "--yes"])
+    clear_all_dry_run_args = parser.parse_args(["clear-all", "--dry-run"])
     doctor_json_args = parser.parse_args(["doctor", "--json"])
     push_args = parser.parse_args(["push", "--client-secret-path", "client.json", "--folder-id", "folder123"])
     pull_args = parser.parse_args(["pull", "file123", "--client-secret-path", "client.json"])
@@ -240,11 +248,14 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert clear_session_args.command == "clear-session"
     assert clear_session_args.session_id == "thread-1"
     assert clear_session_args.yes is True
+    assert clear_session_dry_run_args.dry_run is True
     assert clear_project_args.command == "clear-project"
     assert clear_project_args.project == "MCP"
     assert clear_project_args.yes is True
+    assert clear_project_dry_run_args.dry_run is True
     assert clear_all_args.command == "clear-all"
     assert clear_all_args.yes is True
+    assert clear_all_dry_run_args.dry_run is True
     assert doctor_json_args.command == "doctor"
     assert doctor_json_args.json_output is True
     assert push_args.command == "push"
@@ -255,10 +266,32 @@ def test_parser_accepts_graph_editor_commands() -> None:
     assert share_args.command == "share"
     assert share_args.file_ref == "file123"
 
+    doctor_json_args = parser.parse_args(["doctor", "--json"])
+    doctor_as_json_args = parser.parse_args(["doctor", "--as-json"])
+    assert doctor_json_args.command == "doctor"
+    assert doctor_json_args.json_output is True
+    assert doctor_as_json_args.command == "doctor"
+    assert doctor_as_json_args.json_output is True
+
+
+def test_run_doctor_has_single_invocation_site() -> None:
+    tree = ast.parse(inspect.getsource(server_module))
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_run_doctor"
+    ]
+
+    assert len(calls) == 1
+
 
 def test_doctor_flags_mixed_embedding_model_ids(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    mock_config = tmp_path / "mock_config.json"
+    mock_config.write_text(json.dumps({"mcpServers": {"waggle": {}}}))
+    monkeypatch.setattr("waggle.server._KNOWN_CONFIG_PATHS", [("Mock Client", str(mock_config))])
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -311,8 +344,11 @@ def test_doctor_flags_mixed_embedding_model_ids(
 
 
 def test_doctor_fix_reembeds_mixed_embedding_model_ids(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    mock_config = tmp_path / "mock_config.json"
+    mock_config.write_text(json.dumps({"mcpServers": {"waggle": {}}}))
+    monkeypatch.setattr("waggle.server._KNOWN_CONFIG_PATHS", [("Mock Client", str(mock_config))])
     db_path = tmp_path / "server-memory.db"
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -407,13 +443,13 @@ def test_doctor_json_output_reports_status(
     assert exit_code == 1
     assert captured.err == ""
     assert "\x1b[" not in captured.out
-    assert payload["schema_version"] == 1
-    assert payload["platform"]
-    assert payload["status"] == "issues_found"
-    assert payload["warnings"] == []
-    assert payload["fix_requested"] is False
-    assert any("No MCP client config file" in issue for issue in payload["issues"])
-    assert "Deterministic model — no download needed" in payload["successful_checks"]
+    assert payload["version"] == waggle.__version__
+    assert payload["checks"]["mcp_config"]["status"] == "fail"
+    assert "reason" in payload["checks"]["mcp_config"]
+    assert payload["checks"]["embedding_model"] == {"status": "ok", "model_id": "deterministic"}
+    assert payload["summary"]["fail"] >= 1
+    total_checks = sum(payload["summary"].values())
+    assert total_checks == len(payload["checks"])
     assert "waggle-mcp doctor" not in captured.out
 
 
@@ -459,12 +495,16 @@ def test_doctor_json_output_ok_status(
     assert exit_code == 0
     assert captured.err == ""
     assert "\x1b[" not in captured.out
-    assert payload["schema_version"] == 1
-    assert payload["status"] == "ok"
-    assert payload["issues"] == []
-    assert payload["warnings"] == []
-    assert payload["fix_requested"] is False
-    assert any(item.startswith("Waggle found in:") for item in payload["successful_checks"])
+    assert payload["version"] == waggle.__version__
+    assert payload["summary"]["fail"] == 0
+    assert payload["checks"]["mcp_config"] == {"status": "ok", "found_in": ["Codex"]}
+    assert payload["checks"]["db_connection"]["status"] == "ok"
+    assert payload["checks"]["embedding_model"] == {"status": "ok", "model_id": "deterministic"}
+    assert payload["checks"]["graph_schema"]["status"] == "ok"
+    assert payload["checks"]["startup_mode"] == {"status": "ok", "mode": "normal"}
+    assert "stdout_encoding" in payload["checks"]
+    total_checks = sum(payload["summary"].values())
+    assert total_checks == len(payload["checks"])
 
 
 def test_doctor_json_output_warning_status_for_uncached_model(
@@ -507,9 +547,109 @@ def test_doctor_json_output_warning_status_for_uncached_model(
     payload = json.loads(captured.out)
 
     assert exit_code == 0
-    assert payload["status"] == "warnings"
-    assert payload["issues"] == []
-    assert any("not found in cache" in warning for warning in payload["warnings"])
+    assert payload["summary"]["fail"] == 0
+    assert payload["summary"]["warn"] >= 1
+    embedding_model_check = payload["checks"]["embedding_model"]
+    assert embedding_model_check["status"] == "warn"
+    assert embedding_model_check["model_id"] == "sentence-transformers/not-cached-for-waggle-test"
+    assert "not found in cache" in embedding_model_check["reason"]
+
+
+def test_doctor_json_output_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    appdata = home / "AppData" / "Roaming"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="deterministic",
+        db_path=str(tmp_path / "server-memory.db"),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+
+    exit_code = _run_doctor(config, json_output=True)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["checks"], "checks must not be empty"
+    recomputed_summary = {"ok": 0, "warn": 0, "fail": 0}
+    for name, check in payload["checks"].items():
+        assert check["status"] in ("ok", "warn", "fail"), f"{name} has unexpected status"
+        recomputed_summary[check["status"]] += 1
+
+    assert payload["summary"] == recomputed_summary
+
+    # No MCP config file is present, so mcp_config fails and the exit code
+    # must reflect that.
+    assert payload["summary"]["fail"] >= 1
+    assert exit_code == 1
+
+
+def test_doctor_text_output_unchanged_without_json_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    appdata = home / "AppData" / "Roaming"
+    db_path = tmp_path / "server-memory.db"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("APPDATA", str(appdata))
+    write_waggle_codex_config(home, db_path)
+
+    config = AppConfig(
+        backend="sqlite",
+        transport="stdio",
+        model_name="deterministic",
+        db_path=str(db_path),
+        default_tenant_id="local-default",
+        http_host="127.0.0.1",
+        http_port=8080,
+        log_level="INFO",
+        rate_limit_rpm=120,
+        write_rate_limit_rpm=60,
+        max_concurrent_requests=8,
+        max_payload_bytes=1024 * 1024,
+        request_timeout_seconds=30,
+        export_dir=None,
+        neo4j_uri="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_database="",
+    )
+
+    exit_code = _run_doctor(config)
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "waggle-mcp doctor" in captured.out
+    assert "[1] MCP client config files" in captured.out
+    assert "All checks passed" in captured.out
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(captured.out)
 
 
 def test_create_and_list_api_keys_cli_redacts_hash(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1845,9 +1985,46 @@ def test_write_codex_config_updates_existing_file_without_duplicates(
     assert '[mcp_servers.playwright]\ncommand = "npx"' in contents
     assert 'command = "waggle-mcp"' in contents
     assert 'args = ["serve", "--transport", "stdio"]' in contents
-    assert f'WAGGLE_DB_PATH = "{tmp_path / "memory.db"}"' in contents
+    expected_db_path = str(tmp_path / "memory.db").replace("\\", "\\\\")
+    assert f'WAGGLE_DB_PATH = "{expected_db_path}"' in contents
     assert "/old/python" not in contents
     assert "/old/memory.db" not in contents
+
+
+def test_validate_startup_warns_for_live_default_tenant(tmp_path, caplog):
+    app = make_app(tmp_path)
+
+    app.config.api_key_environment = "live"
+    app.config.default_tenant_id = "local-default"
+
+    with caplog.at_level("WARNING"):
+        app.validate_startup()
+
+    assert "WAGGLE_API_KEY_ENVIRONMENT is set to 'live'" in caplog.text
+
+
+def test_validate_startup_does_not_warn_for_custom_tenant(tmp_path, caplog):
+    app = make_app(tmp_path)
+
+    app.config.api_key_environment = "live"
+    app.config.default_tenant_id = "workspace-prod"
+
+    with caplog.at_level("WARNING"):
+        app.validate_startup()
+
+    assert "WAGGLE_API_KEY_ENVIRONMENT is set to 'live'" not in caplog.text
+
+
+def test_validate_startup_does_not_warn_for_test_environment(tmp_path, caplog):
+    app = make_app(tmp_path)
+
+    app.config.api_key_environment = "test"
+    app.config.default_tenant_id = "local-default"
+
+    with caplog.at_level("WARNING"):
+        app.validate_startup()
+
+    assert "WAGGLE_API_KEY_ENVIRONMENT is set to 'live'" not in caplog.text
 
 
 def test_write_codex_agents_creates_managed_block(tmp_path: Path) -> None:
@@ -1880,3 +2057,161 @@ def test_write_codex_agents_updates_existing_block_without_duplication(tmp_path:
     assert "Keep this note." in contents
     assert AUTOMATIC_MEMORY_RULE_TEXT.strip() in contents
     assert "build_context before answers and on_assistant_turn after answers" in contents
+
+
+def test_clear_tools_dry_run_preview(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+
+    app.graph.add_node(
+        label="Vault Decision",
+        content="Export this node to a markdown vault.",
+        node_type=NodeType.DECISION,
+        project="alpha",
+        session_id="sess-1",
+    )
+    app.graph.observe_conversation(
+        user_message="Use Redis for caching.",
+        assistant_response="Noted.",
+        project="alpha",
+        session_id="sess-1",
+    )
+
+    # 1. Test clear_session with dry_run=True (without confirm!)
+    result = app.handle_tool_call("clear_session", {"session_id": "sess-1", "dry_run": True})
+    assert result.isError is False
+    assert result.structuredContent["dry_run"] is True
+    assert result.structuredContent["deleted_nodes"] > 0
+    assert result.structuredContent["deleted_transcripts"] > 0
+    # Should contain counts_by_node_type
+    assert any(k in result.structuredContent["counts_by_node_type"] for k in ("decision", "note", "entity", "fact"))
+    # Check text content prefix
+    assert "[Preview] Would clear" in result.content[0].text
+
+    # Verify data still exists
+    assert app.graph.get_stats().total_nodes > 0
+    # Verify no audit event
+    assert len(app.graph.list_audit_events(event_type="graph.scope_cleared")) == 0
+
+    # 2. Test clear_project with dry_run=True
+    result_proj = app.handle_tool_call("clear_project", {"project": "alpha", "dry_run": True})
+    assert result_proj.isError is False
+    assert result_proj.structuredContent["dry_run"] is True
+    assert result_proj.structuredContent["deleted_nodes"] > 0
+    assert "[Preview] Would clear" in result_proj.content[0].text
+
+    # 3. Test clear_all with dry_run=True
+    result_all = app.handle_tool_call("clear_all", {"dry_run": True})
+    assert result_all.isError is False
+    assert result_all.structuredContent["dry_run"] is True
+    assert result_all.structuredContent["deleted_nodes"] > 0
+    assert "[Preview] Would clear" in result_all.content[0].text
+
+
+def test_clear_cli_commands_dry_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    app = make_app(tmp_path)
+
+    app.graph.add_node(
+        label="Test Node",
+        content="Use Redis for caching.",
+        node_type=NodeType.DECISION,
+        project="alpha",
+        session_id="sess-1",
+    )
+    app.graph.observe_conversation(
+        user_message="Use Redis for caching.",
+        assistant_response="Noted.",
+        project="alpha",
+        session_id="sess-1",
+    )
+
+    # Run clear-session with dry-run
+    args = SimpleNamespace(
+        command="clear-session",
+        session_id="sess-1",
+        dry_run=True,
+        yes=False,
+    )
+    exit_code = _run_admin_command(app.config, args)
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["deleted_nodes"] > 0
+    assert payload["deleted_transcripts"] > 0
+
+    # Verify data is not deleted
+    assert app.graph.get_stats().total_nodes > 0
+
+    # Run clear-project with dry-run
+    args = SimpleNamespace(
+        command="clear-project",
+        project="alpha",
+        dry_run=True,
+        yes=False,
+    )
+    exit_code = _run_admin_command(app.config, args)
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["deleted_nodes"] > 0
+
+    # Run clear-all with dry-run
+    args = SimpleNamespace(
+        command="clear-all",
+        dry_run=True,
+        yes=False,
+    )
+    exit_code = _run_admin_command(app.config, args)
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["deleted_nodes"] > 0
+
+
+# ── Tests for --hooks per-tool selection ─────────────────────────
+
+
+class TestHookToolsFromArgs:
+    def test_auto_selects_claude_code(self):
+        # Default behavior: 'auto' installs hooks for all hook-capable tools.
+        assert _hook_tools_from_args("auto", no_hooks=False) == ["Claude Code"]
+
+    def test_empty_defaults_to_auto(self):
+        assert _hook_tools_from_args("", no_hooks=False) == ["Claude Code"]
+
+    def test_none_selects_nothing(self):
+        assert _hook_tools_from_args("none", no_hooks=False) == []
+
+    def test_no_hooks_flag_overrides_to_none(self):
+        # --no-hooks is a deprecated alias for --hooks none and wins over auto.
+        assert _hook_tools_from_args("auto", no_hooks=True) == []
+
+    def test_explicit_claude_code(self):
+        assert _hook_tools_from_args("claude-code", no_hooks=False) == ["Claude Code"]
+
+    def test_underscore_alias(self):
+        assert _hook_tools_from_args("claude_code", no_hooks=False) == ["Claude Code"]
+
+    def test_unknown_tool_raises(self):
+        # A client that has config support but no hooks (e.g. cursor) is rejected.
+        with pytest.raises(ValidationFailure):
+            _hook_tools_from_args("cursor", no_hooks=False)
+
+    def test_dry_run_validates_hooks(self):
+        # Regression for CodeRabbit review: invalid --hooks must be caught
+        # even in dry-run mode (validation happens before the early return).
+        args = SimpleNamespace(
+            yes=True,
+            dry_run=True,
+            db="",
+            model="all-MiniLM-L6-v2",
+            clients="codex",
+            hooks="bogus",
+            no_hooks=False,
+            project_instructions=False,
+            run_doctor=False,
+        )
+        with pytest.raises(ValidationFailure):
+            _run_setup(args)
